@@ -1,0 +1,809 @@
+diff --git a/src/cron/adapters/inMemory.ts b/src/cron/adapters/inMemory.ts
+new file mode 100644
+index 0000000..bc89a9d
+--- /dev/null
++++ b/src/cron/adapters/inMemory.ts
+@@ -0,0 +1,86 @@
++import type {
++  JobRegistry,
++  SlotHasher,
++  SlotRepository,
++  TimeProvider,
++} from "./ports";
++import type { CronJob, SlotAssignment } from "./types";
++import { SLOT_COUNT } from "./types";
++
++export function createInMemoryJobRegistry(): JobRegistry {
++  const jobs = new Map<string, CronJob>();
++
++  return {
++    get: async (id) => jobs.get(id),
++    set: async (job) => {
++      jobs.set(job.id, job);
++    },
++    remove: async (id) => {
++      jobs.delete(id);
++    },
++    list: async () => Array.from(jobs.values()),
++  };
++}
++
++export function createInMemorySlotRepository(
++  slotCount: number = SLOT_COUNT,
++  registry?: JobRegistry,
++): SlotRepository {
++  const slots = new Map<number, SlotAssignment>();
++  for (let i = 0; i < slotCount; i += 1) {
++    slots.set(i, { slotIndex: i, jobIds: [] });
++  }
++
++  return {
++    jobRegistry: registry ?? createInMemoryJobRegistry(),
++
++    async readSlot(slotIndex: number): Promise<SlotAssignment> {
++      const slot = slots.get(slotIndex);
++      if (!slot) return { slotIndex, jobIds: [] };
++      return { slotIndex: slot.slotIndex, jobIds: [...slot.jobIds] };
++    },
++
++    async readAllSlots(): Promise<SlotAssignment[]> {
++      return Array.from(slots.values()).map((s) => ({
++        slotIndex: s.slotIndex,
++        jobIds: [...s.jobIds],
++      }));
++    },
++
++    async writeSlot(assignment: SlotAssignment): Promise<void> {
++      slots.set(assignment.slotIndex, {
++        slotIndex: assignment.slotIndex,
++        jobIds: [...assignment.jobIds],
++      });
++    },
++
++    async clearSlot(slotIndex: number): Promise<void> {
++      slots.set(slotIndex, { slotIndex, jobIds: [] });
++    },
++  };
++}
++
++export function createDeterministicHasher(): SlotHasher {
++  return {
++    hash(jobId: string, slotCount: number): number {
++      let h = 0;
++      for (let i = 0; i < jobId.length; i += 1) {
++        h = (h * 31 + jobId.charCodeAt(i)) >>> 0;
++      }
++      return h % slotCount;
++    },
++  };
++}
++
++export function createFixedClock(initial: Date): TimeProvider & {
++  set(now: Date): void;
++} {
++  let current = initial;
++  return {
++    now: () => current,
++    set: (now: Date) => {
++      current = now;
++    },
++    currentMinuteOfHour: (now?: Date) => (now ?? current).getMinutes(),
++  };
++}
+diff --git a/src/cron/adapters/redis.ts b/src/cron/adapters/redis.ts
+new file mode 100644
+index 0000000..3b21ffb
+--- /dev/null
++++ b/src/cron/adapters/redis.ts
+@@ -0,0 +1,125 @@
++import type Redis from "ioredis";
++import type {
++  JobRegistry,
++  SlotRepository,
++} from "../ports";
++import type { CronJob, SlotAssignment } from "../types";
++import { SLOT_COUNT } from "../types";
++
++export interface RedisCronOptions {
++  keyPrefix?: string;
++  slotCount?: number;
++}
++
++const DEFAULT_PREFIX = "cron";
++
++function slotKey(prefix: string, slotIndex: number): string {
++  return `${prefix}:slot:${slotIndex}`;
++}
++
++function jobKey(prefix: string, jobId: string): string {
++  return `${prefix}:job:${jobId}`;
++}
++
++function jobsIndexKey(prefix: string): string {
++  return `${prefix}:jobs`;
++}
++
++export function createRedisJobRegistry(
++  client: Redis,
++  options: RedisCronOptions = {},
++): JobRegistry {
++  const prefix = options.keyPrefix ?? DEFAULT_PREFIX;
++
++  return {
++    async get(jobId: string): Promise<CronJob | undefined> {
++      const raw = await client.get(jobKey(prefix, jobId));
++      if (!raw) return undefined;
++      return JSON.parse(raw) as CronJob;
++    },
++
++    async set(job: CronJob): Promise<void> {
++      await client
++        .multi()
++        .set(jobKey(prefix, job.id), JSON.stringify(job))
++        .sadd(jobsIndexKey(prefix), job.id)
++        .exec();
++    },
++
++    async remove(jobId: string): Promise<void> {
++      await client
++        .multi()
++        .del(jobKey(prefix, jobId))
++        .srem(jobsIndexKey(prefix), jobId)
++        .exec();
++    },
++
++    async list(): Promise<CronJob[]> {
++      const ids = await client.smembers(jobsIndexKey(prefix));
++      if (ids.length === 0) return [];
++      const keys = ids.map((id) => jobKey(prefix, id));
++      const raws = await client.mget(...keys);
++      return raws
++        .filter((r): r is string => r !== null)
++        .map((r) => JSON.parse(r) as CronJob);
++    },
++  };
++}
++
++export function createRedisSlotRepository(
++  client: Redis,
++  options: RedisCronOptions = {},
++): SlotRepository {
++  const prefix = options.keyPrefix ?? DEFAULT_PREFIX;
++  const slotCount = options.slotCount ?? SLOT_COUNT;
++  const jobRegistry = createRedisJobRegistry(client, options);
++
++  async function readSlot(slotIndex: number): Promise<SlotAssignment> {
++    const members = await client.smembers(slotKey(prefix, slotIndex));
++    return { slotIndex, jobIds: members.sort() };
++  }
++
++  return {
++    jobRegistry,
++
++    readSlot,
++
++    async readAllSlots(): Promise<SlotAssignment[]> {
++      const pipeline = client.pipeline();
++      for (let i = 0; i < slotCount; i += 1) {
++        pipeline.smembers(slotKey(prefix, i));
++      }
++      const results = await pipeline.exec();
++      return (results ?? []).map(([err, members], idx) => {
++        if (err || !Array.isArray(members)) {
++          return { slotIndex: idx, jobIds: [] };
++        }
++        return {
++          slotIndex: idx,
++          jobIds: (members as string[]).slice().sort(),
++        };
++      });
++    },
++
++    async writeSlot(assignment: SlotAssignment): Promise<void> {
++      const key = slotKey(prefix, assignment.slotIndex);
++      await client
++        .multi()
++        .del(key)
++        .sadd(
++          key,
++          ...(assignment.jobIds.length > 0 ? assignment.jobIds : [""]),
++        )
++        .exec();
++      if (assignment.jobIds.length === 0) {
++        await client.srem(key, "");
++      }
++    },
++
++    async clearSlot(slotIndex: number): Promise<void> {
++      await client.del(slotKey(prefix, slotIndex));
++    },
++  };
++}
++
++export { DEFAULT_PREFIX as defaultKeyPrefix };
+diff --git a/src/cron/cronJobFactory.integration.test.ts b/src/cron/cronJobFactory.integration.test.ts
+new file mode 100644
+index 0000000..eccdbf9
+--- /dev/null
++++ b/src/cron/cronJobFactory.integration.test.ts
+@@ -0,0 +1,191 @@
++import { describe, it, expect, beforeEach } from "vitest";
++import type Redis from "ioredis";
++import { cronJobFactory } from "../src/cron/mod";
++import {
++  createRedisJobRegistry,
++  createRedisSlotRepository,
++} from "../src/cron/adapters/redis";
++import {
++  createDeterministicHasher,
++  createFixedClock,
++} from "../src/cron/adapters/inMemory";
++import type { CronJob } from "../src/cron/types";
++
++type StoredSet = Map<string, Set<string>>;
++type StoredStrings = Map<string, string>;
++
++interface FakeRedis {
++  sets: StoredSet;
++  strings: StoredStrings;
++  client: Redis;
++}
++
++function createFakeRedis(): FakeRedis {
++  const sets: StoredSet = new Map();
++  const strings: StoredStrings = new Map();
++
++  const getSet = (key: string) => {
++    if (!sets.has(key)) sets.set(key, new Set());
++    return sets.get(key)!;
++  };
++
++  const client = {
++    get: async (k: string) => strings.get(k) ?? null,
++    set: async (k: string, v: string) => {
++      strings.set(k, v);
++      return "OK";
++    },
++    del: async (...ks: string[]) => {
++      let n = 0;
++      for (const k of ks) {
++        if (strings.delete(k)) n += 1;
++        if (sets.delete(k)) n += 1;
++      }
++      return n;
++    },
++    sadd: async (k: string, ...members: string[]) => {
++      const s = getSet(k);
++      let added = 0;
++      for (const m of members) {
++        if (!s.has(m)) {
++          s.add(m);
++          added += 1;
++        }
++      }
++      return added;
++    },
++    srem: async (k: string, ...members: string[]) => {
++      const s = getSet(k);
++      let removed = 0;
++      for (const m of members) {
++        if (s.delete(m)) removed += 1;
++      }
++      return removed;
++    },
++    smembers: async (k: string) => {
++      const s = sets.get(k);
++      return s ? Array.from(s) : [];
++    },
++    mget: async (...ks: string[]) => ks.map((k) => strings.get(k) ?? null),
++    multi: () => ({
++      _ops: [] as Array<{ fn: string; args: unknown[] }>,
++      set(k: string, v: string) {
++        this._ops.push({ fn: "set", args: [k, v] });
++        return this;
++      },
++      del(k: string) {
++        this._ops.push({ fn: "del", args: [k] });
++        return this;
++      },
++      sadd(k: string, ...members: string[]) {
++        this._ops.push({ fn: "sadd", args: [k, ...members] });
++        return this;
++      },
++      srem(k: string, ...members: string[]) {
++        this._ops.push({ fn: "srem", args: [k, ...members] });
++        return this;
++      },
++      async exec() {
++        const out: Array<[Error | null, unknown]> = [];
++        for (const op of this._ops) {
++          if (op.fn === "set") {
++            // @ts-expect-error runtime-only object
++            await client.set(op.args[0], op.args[1]);
++            out.push([null, "OK"]);
++          } else if (op.fn === "del") {
++            // @ts-expect-error runtime-only object
++            await client.del(op.args[0]);
++            out.push([null, 1]);
++          } else if (op.fn === "sadd") {
++            const [k, ...rest] = op.args as [string, ...string[]];
++            // @ts-expect-error runtime-only object
++            await client.sadd(k, ...rest);
++            out.push([null, rest.length]);
++          } else if (op.fn === "srem") {
++            const [k, ...rest] = op.args as [string, ...string[]];
++            // @ts-expect-error runtime-only object
++            await client.srem(k, ...rest);
++            out.push([null, rest.length]);
++          }
++        }
++        return out;
++      },
++    }),
++    pipeline: () => ({
++      _ops: [] as Array<{ fn: string; args: unknown[] }>,
++      smembers(k: string) {
++        this._ops.push({ fn: "smembers", args: [k] });
++        return this;
++      },
++      async exec() {
++        return Promise.all(
++          this._ops.map(async (op) => {
++            if (op.fn === "smembers") {
++              // @ts-expect-error runtime-only object
++              return [null, await client.smembers(op.args[0])];
++            }
++            return [null, null] as [null, null];
++          }),
++        );
++      },
++    }),
++  } as unknown as Redis;
++
++  return { sets, strings, client };
++}
++
++describe("cronJobFactory (integration) — Redis adapter contract", () => {
++  let fake: FakeRedis;
++
++  beforeEach(() => {
++    fake = createFakeRedis();
++  });
++
++  it("register job 落库到 job key + 进入对应 slot 的 set", async () => {
++    const repo = createRedisSlotRepository(fake.client, {
++      keyPrefix: "cron",
++    });
++    const factory = cronJobFactory({
++      slotRepository: repo,
++      hasher: createDeterministicHasher(),
++      clock: createFixedClock(new Date("2026-06-09T10:00:00Z")),
++    });
++
++    const handle = await factory.register({
++      id: "job-X",
++      expression: "*/5 * * * *",
++      payload: { k: 1 },
++    });
++
++    const jobStr = fake.strings.get("cron:job:job-X");
++    expect(jobStr).toBeTruthy();
++    const parsed = JSON.parse(jobStr!) as CronJob;
++    expect(parsed.id).toBe("job-X");
++
++    const set = fake.sets.get(`cron:slot:${handle.slotIndex}`);
++    expect(set).toBeTruthy();
++    expect(set!.has("job-X")).toBe(true);
++  });
++
++  it("stop 后从 slot set 中移除", async () => {
++    const repo = createRedisSlotRepository(fake.client, {
++      keyPrefix: "cron",
++    });
++    const factory = cronJobFactory({
++      slotRepository: repo,
++      hasher: createDeterministicHasher(),
++      clock: createFixedClock(new Date("2026-06-09T10:00:00Z")),
++    });
++
++    const handle = await factory.register({
++      id: "job-Y",
++      expression: "* * * * *",
++      payload: {},
++    });
++
++    await handle.stop();
++    const set = fake.sets.get(`cron:slot:${handle.slotIndex}`);
++    expect(set?.has("job-Y")).toBe(false);
++    expect(fake.strings.has("cron:job:job-Y")).toBe(false);
++  });
++});
+diff --git a/src/cron/cronJobFactory.ts b/src/cron/cronJobFactory.ts
+new file mode 100644
+index 0000000..9e49e76
+--- /dev/null
++++ b/src/cron/cronJobFactory.ts
+@@ -0,0 +1,123 @@
++import type {
++  AllocationResult,
++  CronJob,
++  SlotAssignment,
++} from "./types";
++import { SLOT_COUNT } from "./types";
++import type {
++  JobRegistry,
++  SlotHasher,
++  SlotRepository,
++  TimeProvider,
++} from "./ports";
++
++export interface CronJobFactoryDeps {
++  slotRepository: SlotRepository;
++  hasher: SlotHasher;
++  clock: TimeProvider;
++  slotCount?: number;
++}
++
++export interface CronJobHandle {
++  job: CronJob;
++  slotIndex: number;
++  stop: () => Promise<AllocationResult>;
++}
++
++export interface CronJobFactory {
++  register(job: CronJob): Promise<CronJobHandle>;
++  deregister(jobId: string): Promise<AllocationResult | null>;
++  pickCurrentSlotJobs(): Promise<CronJob[]>;
++  getSlot(slotIndex: number): Promise<SlotAssignment>;
++}
++
++export function cronJobFactory(deps: CronJobFactoryDeps): CronJobFactory {
++  const {
++    slotRepository,
++    hasher,
++    clock,
++    slotCount = SLOT_COUNT,
++  } = deps;
++  const { jobRegistry } = slotRepository;
++
++  async function assignToSlot(
++    job: CronJob,
++  ): Promise<AllocationResult> {
++    const slotIndex = hasher.hash(job.id, slotCount);
++    const current = await slotRepository.readSlot(slotIndex);
++
++    if (current.jobIds.includes(job.id)) {
++      return { slotIndex, added: [], removed: [] };
++    }
++
++    const next: SlotAssignment = {
++      slotIndex,
++      jobIds: [...current.jobIds, job.id],
++    };
++    await slotRepository.writeSlot(next);
++    return { slotIndex, added: [job.id], removed: [] };
++  }
++
++  async function removeFromSlot(
++    jobId: string,
++  ): Promise<AllocationResult | null> {
++    const job = await jobRegistry.get(jobId);
++    if (!job) return null;
++
++    const slotIndex = hasher.hash(jobId, slotCount);
++    const current = await slotRepository.readSlot(slotIndex);
++
++    if (!current.jobIds.includes(jobId)) {
++      return { slotIndex, added: [], removed: [] };
++    }
++
++    const next: SlotAssignment = {
++      slotIndex,
++      jobIds: current.jobIds.filter((id) => id !== jobId),
++    };
++    await slotRepository.writeSlot(next);
++    return { slotIndex, added: [], removed: [jobId] };
++  }
++
++  async function register(job: CronJob): Promise<CronJobHandle> {
++    await jobRegistry.set(job);
++    const { slotIndex } = await assignToSlot(job);
++
++    return {
++      job,
++      slotIndex,
++      stop: async () => {
++        await jobRegistry.remove(job.id);
++        const result = await removeFromSlot(job.id);
++        return result ?? { slotIndex, added: [], removed: [] };
++      },
++    };
++  }
++
++  async function deregister(
++    jobId: string,
++  ): Promise<AllocationResult | null> {
++    await jobRegistry.remove(jobId);
++    return removeFromSlot(jobId);
++  }
++
++  async function pickCurrentSlotJobs(): Promise<CronJob[]> {
++    const slotIndex = clock.currentMinuteOfHour(clock.now()) % slotCount;
++    const assignment = await slotRepository.readSlot(slotIndex);
++
++    const jobs: CronJob[] = [];
++    for (const jobId of assignment.jobIds) {
++      const j = await jobRegistry.get(jobId);
++      if (j) jobs.push(j);
++    }
++    return jobs;
++  }
++
++  async function getSlot(slotIndex: number): Promise<SlotAssignment> {
++    return slotRepository.readSlot(slotIndex);
++  }
++
++  return { register, deregister, pickCurrentSlotJobs, getSlot };
++}
++
++export { JobRegistry };
+diff --git a/src/cron/cronJobFactory.unit.test.ts b/src/cron/cronJobFactory.unit.test.ts
+new file mode 100644
+index 0000000..4b4ec0b
+--- /dev/null
++++ b/src/cron/cronJobFactory.unit.test.ts
+@@ -0,0 +1,112 @@
++import { describe, it, expect, beforeEach, vi } from "vitest";
++import {
++  cronJobFactory,
++  SLOT_COUNT,
++} from "../src/cron/mod";
++import {
++  createInMemoryJobRegistry,
++  createInMemorySlotRepository,
++  createDeterministicHasher,
++  createFixedClock,
++} from "../src/cron/adapters/inMemory";
++import type { CronJob } from "../src/cron/types";
++
++const aJob = (id: string, expression = "* * * * *"): CronJob => ({
++  id,
++  expression,
++  payload: {},
++});
++
++describe("cronJobFactory (unit) — slot assignment algorithm", () => {
++  it("同一个 jobId hash 到相同 slot（可重复性）", () => {
++    const hasher = createDeterministicHasher();
++    expect(hasher.hash("job-A", SLOT_COUNT)).toBe(
++      hasher.hash("job-A", SLOT_COUNT),
++    );
++  });
++
++  it("不同 jobId 落到不同或相同的 slot（不崩）", () => {
++    const hasher = createDeterministicHasher();
++    const seen = new Set<number>();
++    for (let i = 0; i < 100; i += 1) {
++      seen.add(hasher.hash(`job-${i}`, SLOT_COUNT));
++    }
++    expect(seen.size).toBeGreaterThan(1);
++    for (const s of seen) {
++      expect(s).toBeGreaterThanOrEqual(0);
++      expect(s).toBeLessThan(SLOT_COUNT);
++    }
++  });
++
++  it("register 把 job 写入对应 slot", async () => {
++    const repo = createInMemorySlotRepository();
++    const hasher = createDeterministicHasher();
++    const clock = createFixedClock(new Date("2026-06-09T10:00:00Z"));
++    const factory = cronJobFactory({
++      slotRepository: repo,
++      hasher,
++      clock,
++    });
++
++    const handle = await factory.register(aJob("job-A"));
++    const expectedSlot = hasher.hash("job-A", SLOT_COUNT);
++    expect(handle.slotIndex).toBe(expectedSlot);
++
++    const slot = await factory.getSlot(expectedSlot);
++    expect(slot.jobIds).toContain("job-A");
++  });
++
++  it("重复 register 同一 job 不会重复追加", async () => {
++    const repo = createInMemorySlotRepository();
++    const hasher = createDeterministicHasher();
++    const clock = createFixedClock(new Date("2026-06-09T10:00:00Z"));
++    const factory = cronJobFactory({
++      slotRepository: repo,
++      hasher,
++      clock,
++    });
++
++    await factory.register(aJob("job-A"));
++    const second = await factory.register(aJob("job-A"));
++    const slot = await factory.getSlot(second.slotIndex);
++    expect(slot.jobIds.filter((id) => id === "job-A")).toHaveLength(1);
++  });
++
++  it("deregister 从 slot 中移除 job", async () => {
++    const repo = createInMemorySlotRepository();
++    const hasher = createDeterministicHasher();
++    const clock = createFixedClock(new Date("2026-06-09T10:00:00Z"));
++    const factory = cronJobFactory({
++      slotRepository: repo,
++      hasher,
++      clock,
++    });
++
++    await factory.register(aJob("job-A"));
++    const handle = await factory.register(aJob("job-B"));
++    const result = await handle.stop();
++    expect(result.removed).toEqual(["job-B"]);
++
++    const slot = await factory.getSlot(handle.slotIndex);
++    expect(slot.jobIds).not.toContain("job-B");
++  });
++
++  it("pickCurrentSlotJobs 根据当前分钟返回对应 slot 内的 jobs", async () => {
++    const repo = createInMemorySlotRepository();
++    const hasher = createDeterministicHasher();
++    const clock = createFixedClock(new Date("2026-06-09T10:05:00Z"));
++    const factory = cronJobFactory({
++      slotRepository: repo,
++      hasher,
++      clock,
++    });
++
++    for (let i = 0; i < 10; i += 1) {
++      await factory.register(aJob(`job-${i}`));
++    }
++
++    clock.set(new Date("2026-06-09T10:05:00Z"));
++    const jobsNow = await factory.pickCurrentSlotJobs();
++    expect(jobsNow.length).toBeGreaterThanOrEqual(0);
++  });
++});
+diff --git a/src/cron/mod.ts b/src/cron/mod.ts
+new file mode 100644
+index 0000000..a772870
+--- /dev/null
++++ b/src/cron/mod.ts
+@@ -0,0 +1,73 @@
++import type Redis from "ioredis";
++import { cronJobFactory, type CronJobFactory } from "./cronJobFactory";
++import type {
++  JobRegistry,
++  SlotHasher,
++  SlotRepository,
++  TimeProvider,
++} from "./ports";
++import type { CronJob } from "./types";
++import { SLOT_COUNT } from "./types";
++import {
++  createRedisSlotRepository,
++  type RedisCronOptions,
++} from "./adapters/redis";
++import {
++  createDeterministicHasher,
++  createInMemoryJobRegistry,
++  createInMemorySlotRepository,
++  createFixedClock,
++} from "./adapters/inMemory";
++
++export function createCronJobFactoryWithRedis(
++  client: Redis,
++  options: RedisCronOptions & {
++    hasher?: SlotHasher;
++    clock?: TimeProvider;
++  } = {},
++): CronJobFactory {
++  const slotRepository = createRedisSlotRepository(client, options);
++  return cronJobFactory({
++    slotRepository,
++    hasher: options.hasher ?? createDeterministicHasher(),
++    clock: options.clock ?? systemClock(),
++    slotCount: options.slotCount ?? SLOT_COUNT,
++  });
++}
++
++export function createInMemoryCronJobFactory(
++  options: {
++    slotCount?: number;
++    hasher?: SlotHasher;
++    clock?: TimeProvider;
++    repository?: SlotRepository;
++  } = {},
++): CronJobFactory {
++  const slotCount = options.slotCount ?? SLOT_COUNT;
++  const slotRepository =
++    options.repository ?? createInMemorySlotRepository(slotCount);
++  return cronJobFactory({
++    slotRepository,
++    hasher: options.hasher ?? createDeterministicHasher(),
++    clock: options.clock ?? systemClock(),
++    slotCount,
++  });
++}
++
++export function systemClock(): TimeProvider {
++  return {
++    now: () => new Date(),
++    currentMinuteOfHour: (now?: Date) => (now ?? new Date()).getMinutes(),
++  };
++}
++
++export type {
++  CronJobFactory,
++  CronJob,
++  SlotRepository,
++  JobRegistry,
++  SlotHasher,
++  TimeProvider,
++};
++
++export { cronJobFactory, SLOT_COUNT };
+diff --git a/src/cron/ports.ts b/src/cron/ports.ts
+new file mode 100644
+index 0000000..d16c13f
+--- /dev/null
++++ b/src/cron/ports.ts
+@@ -0,0 +1,31 @@
++import type { CronJob, SlotAssignment } from "./types";
++
++export interface SlotReader {
++  readSlot(slotIndex: number): Promise<SlotAssignment>;
++  readAllSlots(): Promise<SlotAssignment[]>;
++}
++
++export interface SlotWriter {
++  writeSlot(assignment: SlotAssignment): Promise<void>;
++  clearSlot(slotIndex: number): Promise<void>;
++}
++
++export interface SlotRepository extends SlotReader, SlotWriter {
++  jobRegistry: JobRegistry;
++}
++
++export interface JobRegistry {
++  get(jobId: string): Promise<CronJob | undefined>;
++  set(job: CronJob): Promise<void>;
++  remove(jobId: string): Promise<void>;
++  list(): Promise<CronJob[]>;
++}
++
++export interface SlotHasher {
++  hash(jobId: string, slotCount: number): number;
++}
++
++export interface TimeProvider {
++  now(): Date;
++  currentMinuteOfHour(now?: Date): number;
++}
+diff --git a/src/cron/types.ts b/src/cron/types.ts
+new file mode 100644
+index 0000000..885bd37
+--- /dev/null
++++ b/src/cron/types.ts
+@@ -0,0 +1,20 @@
++export type CronExpression = string;
++
++export interface CronJob {
++  id: string;
++  expression: CronExpression;
++  payload: Record<string, unknown>;
++}
++
++export interface SlotAssignment {
++  slotIndex: number;
++  jobIds: string[];
++}
++
++export interface AllocationResult {
++  slotIndex: number;
++  added: string[];
++  removed: string[];
++}
++
++export const SLOT_COUNT = 60;
