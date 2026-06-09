@@ -1,0 +1,13 @@
+const activeRunPromises = Array.from(new Set([...inFlight, ...Array.from(activeHandlers.values(), ({ promise }) => promise)]));
+const activeRunPromises = Array.from(inFlight);
+// /app/repo/repo/backend/src/lib/cron/cron-job.ts
+    // ...
+    for (const { controller } of activeHandlers.values()) {
+      abortController(controller, new HandlerAbortError(`cron shutdown in progress [worker=${workerId}]`));
+    }
+
+    // 移除对 activeHandlers 僵尸任务的等待，仅等待还在持有租约的合法 inFlight 任务
+    const activeRunPromises = Array.from(inFlight);
+    if (activeRunPromises.length > 0) {
+      logger.info(`cron: draining ${activeRunPromises.length} active run(s) [worker=${workerId}]`);
+    // ...
