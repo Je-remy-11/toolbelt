@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import inspect
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
+
+
+class AsyncDisposable(Protocol):
+    async def aclose(self) -> None: ...
+
+
+BootstrapFactory = Callable[..., Awaitable[Any]]
+BootstrapStep = Callable[..., Awaitable[None]]
+
+
+async def _await_if_needed(result: Any) -> Any:
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _dispose(resource: Any) -> None:
+    for method_name in ("aclose", "close", "disconnect", "shutdown", "stop"):
+        method = getattr(resource, method_name, None)
+        if callable(method):
+            await _await_if_needed(method())
+            return
+    raise TypeError(f"Resource {resource!r} does not expose a supported dispose method")
+
+
+class AsyncResourceManager:
+    def __init__(self) -> None:
+        self._stack = AsyncExitStack()
+
+    async def __aenter__(self) -> "AsyncResourceManager":
+        await self._stack.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self._stack.__aexit__(exc_type, exc, tb)
+
+    def add(self, resource: Any) -> Any:
+        self._stack.push_async_callback(_dispose, resource)
+        return resource
+
+    def callback(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        async def runner() -> None:
+            await _await_if_needed(fn(*args, **kwargs))
+
+        self._stack.push_async_callback(runner)
+
+
+@dataclass(frozen=True)
+class BootstrapRuntime:
+    db: Any
+    hsm_service: Any
+    redis: Any
+    server: Any
+
+
+@dataclass(frozen=True)
+class BootstrapDependencies:
+    init_db: BootstrapFactory
+    init_hsm: BootstrapFactory
+    init_redis: BootstrapFactory
+    run_migrations: BootstrapStep
+    run_seeds: BootstrapStep
+    init_server: BootstrapFactory
+
+
+@asynccontextmanager
+async def setup(dependencies: BootstrapDependencies) -> AsyncIterator[BootstrapRuntime]:
+    async with AsyncResourceManager() as resources:
+        db = resources.add(await dependencies.init_db())
+        hsm_service = resources.add(await dependencies.init_hsm(db))
+        redis = resources.add(await dependencies.init_redis())
+
+        await dependencies.run_migrations(db)
+        await dependencies.run_seeds(db, redis)
+
+        server = resources.add(
+            await dependencies.init_server(
+                db=db,
+                hsm_service=hsm_service,
+                redis=redis,
+            )
+        )
+
+        yield BootstrapRuntime(
+            db=db,
+            hsm_service=hsm_service,
+            redis=redis,
+            server=server,
+        )
+
+
+async def bootstrapCheck(runtime: BootstrapRuntime) -> None:
+    check = getattr(runtime.server, "bootstrap_check", None)
+    if check is None:
+        return
+    await _await_if_needed(check())
+
+
+async def main(dependencies: BootstrapDependencies) -> None:
+    async with setup(dependencies) as runtime:
+        await bootstrapCheck(runtime)
+        serve = getattr(runtime.server, "serve", None)
+        if not callable(serve):
+            raise RuntimeError("Server must expose an async serve() method")
+        await _await_if_needed(serve())
