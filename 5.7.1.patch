@@ -1,0 +1,757 @@
+diff --git a/5.7.1.patch b/5.7.1.patch
+new file mode 100644
+index 0000000..e69de29
+diff --git a/examples/slot/slot_health_demo.py b/examples/slot/slot_health_demo.py
+new file mode 100644
+index 0000000..d3a0cfc
+--- /dev/null
++++ b/examples/slot/slot_health_demo.py
+@@ -0,0 +1,73 @@
++"""Demonstration: expose Slot occupancy via HTTP /health so K8s can safely
++drain the Pod.
++
++In a real container image you would wire the ``/health`` endpoint into the
++Deployment manifest like so::
++
++    readinessProbe:
++      httpGet:
++        path: /health
++        port: 8080
++      periodSeconds: 2
++      failureThreshold: 15
++      # When the process keeps returning 503 (holding slots), the kubelet
++      # marks the Pod NotReady and the endpoint controller removes it from
++      # the Service endpoints. Meanwhile the Pod continues to finish the
++      # in-flight requests it already accepted.
++
++    terminationGracePeriodSeconds: 30  # matches drain_timeout_seconds
++
++Run this example with::
++
++    python examples/slot/slot_health_demo.py
++
++It will print two ``curl`` invocations showing the /health state before and
++after a Slot is acquired.
++"""
++import signal
++import threading
++import time
++
++from requests_toolbelt.slot import HealthServer, SlotManager
++
++
++def main():
++    slots = SlotManager(total=8)
++    server = HealthServer(slots, host="127.0.0.1", port=8080,
++                          drain_timeout_seconds=30)
++    server.start()
++    print("Health server running at {}".format(server.url))
++    print("  curl -i {}health    # expect 200 (empty)".format(server.url))
++
++    held = threading.Event()
++    release = threading.Event()
++
++    def worker():
++        with slots.acquire():
++            held.set()
++            release.wait(timeout=30)
++
++    t = threading.Thread(target=worker)
++    t.daemon = True
++    t.start()
++
++    held.wait()
++    print("  curl -i {}health    # expect 503 (holding slots)".format(
++        server.url))
++
++    def stop(*args):
++        release.set()
++
++    signal.signal(signal.SIGINT, stop)
++    signal.signal(signal.SIGTERM, stop)
++
++    try:
++        while release.is_set() is False:
++            time.sleep(0.5)
++    finally:
++        t.join(timeout=5)
++        server.stop()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/requests_toolbelt/slot/__init__.py b/requests_toolbelt/slot/__init__.py
+new file mode 100644
+index 0000000..522c05f
+--- /dev/null
++++ b/requests_toolbelt/slot/__init__.py
+@@ -0,0 +1,28 @@
++"""Slot occupancy management for Kubernetes graceful termination.
++
++This package exposes a lightweight HTTP /health endpoint that reflects the
++current in-flight Slot occupancy of the process. When Kubernetes scales down a
++Pod it sends a SIGTERM signal; by inspecting /health the kubelet (or an
++operator that drives the lifecycle) can delay the Pod shutdown until the Pod
++has released every Slot it was holding, avoiding dropped traffic.
++
++A typical setup looks like:
++
++.. code-block:: python
++
++    from requests_toolbelt.slot import SlotManager, HealthServer
++
++    slots = SlotManager(total=8)
++    server = HealthServer(slots, host="0.0.0.0", port=8080)
++    server.start()
++
++    with slots.acquire():
++        # do some work that "holds" a Slot
++        ...
++
++    # /health returns 200 -> "empty" / 503 -> "holding" depending on occupancy
++"""
++from .manager import SlotManager
++from .server import HealthServer
++
++__all__ = ["SlotManager", "HealthServer"]
+diff --git a/requests_toolbelt/slot/manager.py b/requests_toolbelt/slot/manager.py
+new file mode 100644
+index 0000000..6e203e9
+--- /dev/null
++++ b/requests_toolbelt/slot/manager.py
+@@ -0,0 +1,184 @@
++"""Thread-safe Slot occupancy tracker.
++
++The :class:`SlotManager` models a bounded pool of "slots" that a process may
++hold while it executes long-running or stateful work. The primary reason this
++is interesting for Kubernetes is that, during a graceful shutdown (SIGTERM),
++the Pod still needs to finish whatever work it has already started before it
++is allowed to terminate. If the kubelet or the operator can observe the
++current Slot occupancy via an HTTP endpoint, it can wait for occupancy to
++drop to zero before removing the Pod from the service endpoints / target
++group, eliminating the window in which traffic is routed to a Pod that is
++about to exit.
++
++The tracker is intentionally minimal:
++
++* :meth:`SlotManager.acquire` / :meth:`SlotManager.release` move a counter
++  under a :class:`threading.Lock` so that readers always observe a
++  consistent snapshot of in-flight work.
++* :meth:`SlotManager.snapshot` returns a JSON-serialisable dict that can be
++  served directly from a :class:`HealthServer`.
++* :meth:`SlotManager.is_holding` is the single boolean that drives the HTTP
++  status code returned by /health.
++
++Example::
++
++    slots = SlotManager(total=8)
++
++    token = slots.acquire()
++    try:
++        ...
++    finally:
++        slots.release(token)
++
++    # -- or, as a context manager --
++    with slots.acquire():
++        ...
++"""
++import threading
++import time
++
++
++class _SlotToken(object):
++    """Opaque token returned by :meth:`SlotManager.acquire`.
++
++    Doubles as a context manager so callers can write::
++
++        with slots.acquire() as token:
++            ...
++    """
++
++    __slots__ = ("id", "acquired_at", "_manager")
++
++    def __init__(self, slot_id, acquired_at, manager):
++        self.id = slot_id
++        self.acquired_at = acquired_at
++        self._manager = manager
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        self._manager.release(self)
++        return False
++
++
++class SlotManager(object):
++    """Track the number of in-flight Slots held by the current process.
++
++    :param total:
++        Maximum number of concurrent Slots the process is allowed to hold.
++        When *total* slots are held, subsequent :meth:`acquire` calls raise
++        :class:`TooManySlots` so callers can apply explicit back-pressure.
++    :type total: int
++    """
++
++    def __init__(self, total):
++        if not isinstance(total, int) or total <= 0:
++            raise ValueError("total must be a positive integer")
++        self._total = total
++        self._lock = threading.Lock()
++        self._next_id = 0
++        self._held = {}  # slot_id -> acquired_at monotonic timestamp
++
++    # ------------------------------------------------------------------ state
++
++    @property
++    def total(self):
++        return self._total
++
++    def occupied(self):
++        """Number of Slots currently held."""
++        with self._lock:
++            return len(self._held)
++
++    def available(self):
++        """Number of Slots that can still be acquired."""
++        with self._lock:
++            return self._total - len(self._held)
++
++    def is_holding(self):
++        """Return True if the process is holding at least one Slot.
++
++        This is the predicate that drives the HTTP status code returned from
++        :class:`HealthServer`'s /health endpoint. When it is ``True`` the
++        Pod still has outstanding work and should not be killed yet; when
++        it is ``False`` the Pod is idle and can be terminated safely.
++        """
++        with self._lock:
++            return len(self._held) > 0
++
++    def snapshot(self):
++        """Return a JSON-serialisable snapshot of the current occupancy.
++
++        The shape of the returned dict is stable and designed to be easy to
++        parse by monitoring tooling. It contains:
++
++        * ``total`` / ``occupied`` / ``available`` – counters
++        * ``is_holding`` – boolean flag for quick checks
++        * ``held_slots`` – list of ``{"id": <int>, "held_seconds": <float>}``
++          so that operators can observe stuck / long-running requests and
++          distinguish them from a harmless backlog.
++        """
++        now = time.monotonic()
++        with self._lock:
++            held_count = len(self._held)
++            held_slots = [
++                {"id": int(slot_id), "held_seconds": round(now - ts, 3)}
++                for slot_id, ts in self._held.items()
++            ]
++        return {
++            "total": self._total,
++            "occupied": held_count,
++            "available": self._total - held_count,
++            "is_holding": held_count > 0,
++            "held_slots": held_slots,
++        }
++
++    # ---------------------------------------------------------------- lifecycle
++
++    def acquire(self):
++        """Atomically claim one Slot.
++
++        :returns: A :class:`_SlotToken` that must be passed back to
++            :meth:`release`. Tokens are also context managers, so the common
++            ``with slots.acquire():`` pattern is supported.
++        :raises TooManySlots: If *total* slots are already held.
++        """
++        with self._lock:
++            if len(self._held) >= self._total:
++                raise TooManySlots(
++                    "slot pool exhausted (total={}, occupied={})".format(
++                        self._total, len(self._held)
++                    )
++                )
++            slot_id = self._next_id
++            self._next_id += 1
++            acquired_at = time.monotonic()
++            self._held[slot_id] = acquired_at
++
++        return _SlotToken(slot_id, acquired_at, self)
++
++    def release(self, token):
++        """Release a Slot previously acquired via :meth:`acquire`.
++
++        Duplicate releases or releases of unknown tokens are silently
++        ignored: a buggy caller must not be able to leak a "held slot"
++        forever or cause a crash in the health endpoint.
++        """
++        if token is None:
++            return
++        try:
++            slot_id = int(token.id)
++        except (AttributeError, TypeError, ValueError):
++            return
++        with self._lock:
++            self._held.pop(slot_id, None)
++
++    def clear(self):
++        """Force-release every Slot. Only useful in tests or emergencies."""
++        with self._lock:
++            self._held.clear()
++
++
++class TooManySlots(Exception):
++    """Raised when :meth:`SlotManager.acquire` would exceed *total*."""
+diff --git a/requests_toolbelt/slot/server.py b/requests_toolbelt/slot/server.py
+new file mode 100644
+index 0000000..6a6d79b
+--- /dev/null
++++ b/requests_toolbelt/slot/server.py
+@@ -0,0 +1,205 @@
++"""Expose :class:`SlotManager` state as HTTP /health and /ready endpoints.
++
++Kubernetes defines three well-known probes:
++
++* ``livenessProbe``  – "is the process still running?"
++* ``readinessProbe`` – "should the process receive traffic right now?"
++* ``startupProbe``   – "did the process finish bootstrapping?"
++
++The natural mapping for Slot occupancy is to drive the **readinessProbe**:
++while the process holds at least one Slot we consider it "unready" from a
++*scale-down safety* point of view and return HTTP 503. Once every Slot is
++released we return HTTP 200 and the Pod is a candidate for immediate
++termination.
++
++We expose three paths:
++
++* ``GET /health``  – 200 when *no* Slot is held, 503 otherwise.
++* ``GET /ready``   – alias for ``/health``.
++* ``GET /status``  – 200 always, returning :meth:`SlotManager.snapshot` as
++  JSON so operators / dashboards can inspect what is actually held.
++
++The implementation uses the stdlib :mod:`http.server` module so the
++dependency footprint stays minimal. A dedicated background thread runs the
++server; :meth:`HealthServer.stop` shuts it down cleanly.
++"""
++import json
++import socket
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++from .manager import SlotManager
++
++
++_STATUS_OK = 200
++_STATUS_SERVICE_UNAVAILABLE = 503
++_STATUS_NOT_FOUND = 404
++_STATUS_METHOD_NOT_ALLOWED = 405
++
++_CONTENT_TYPE_JSON = "application/json; charset=utf-8"
++_CONTENT_TYPE_TEXT = "text/plain; charset=utf-8"
++
++
++class HealthServer(object):
++    """Run a tiny HTTP server that exposes :class:`SlotManager` occupancy.
++
++    :param slot_manager: A :class:`SlotManager` instance whose state will be
++        inspected on every request.
++    :param host: Interface to bind to. Defaults to ``0.0.0.0`` so the server
++        is reachable from inside a Kubernetes Pod.
++    :param port: Port to bind to. Defaults to ``8080``.
++    :param drain_timeout_seconds: Advertised value of *drainTimeoutMs* – the
++        upper bound the kubelet is expected to wait for outstanding slots to
++        be released. The value is echoed in ``/status`` responses so tooling
++        can sanity-check the configured grace period.
++    """
++
++    def __init__(self, slot_manager, host="0.0.0.0", port=8080,
++                 drain_timeout_seconds=30):
++        if not isinstance(slot_manager, SlotManager):
++            raise TypeError(
++                "slot_manager must be a SlotManager, got {!r}".format(
++                    type(slot_manager).__name__
++                )
++            )
++        if not isinstance(port, int) or port < 0:
++            raise ValueError("port must be a non-negative integer")
++
++        self._slot_manager = slot_manager
++        self._host = host
++        self._port = port
++        self._drain_timeout_seconds = float(drain_timeout_seconds)
++
++        # Capture these by closure in the handler factory.
++        server_ref = self
++
++        class _Handler(BaseHTTPRequestHandler):
++            # Silence default per-request access logs while keeping errors.
++            def log_message(self, format, *args):  # noqa: A002
++                return
++
++            def do_GET(self):
++                server_ref._handle(self)
++
++            def do_HEAD(self):
++                server_ref._handle(self, head_only=True)
++
++        server = ThreadingHTTPServer((host, port), _Handler)
++        # Allow quick rebinds in tests / restart loops.
++        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        self._server = server
++        self._thread = None
++
++    # ---------------------------------------------------------------- access
++
++    @property
++    def host(self):
++        return self._host
++
++    @property
++    def port(self):
++        return self._server.server_address[1]
++
++    @property
++    def url(self):
++        host = self._host if self._host else "127.0.0.1"
++        if host == "0.0.0.0":
++            host = "127.0.0.1"
++        return "http://{host}:{port}/".format(host=host, port=self.port)
++
++    # ---------------------------------------------------------------- lifecycle
++
++    def start(self):
++        """Start serving health requests in a background thread.
++
++        Safe to call multiple times – subsequent calls are no-ops.
++        """
++        if self._thread is not None and self._thread.is_alive():
++            return
++        t = threading.Thread(target=self._server.serve_forever,
++                             name="SlotHealthServer")
++        t.daemon = True
++        t.start()
++        self._thread = t
++        return self
++
++    def stop(self):
++        """Cleanly shut down the health server. Idempotent."""
++        if self._server is not None:
++            self._server.shutdown()
++            self._server.server_close()
++        if self._thread is not None:
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self):
++        self.start()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        self.stop()
++        return False
++
++    # ---------------------------------------------------------------- handler
++
++    def _handle(self, handler, head_only=False):
++        path = handler.path.split("?", 1)[0]
++
++        if path in ("/health", "/ready"):
++            self._write_health(handler, head_only)
++        elif path == "/status":
++            self._write_status(handler, head_only)
++        else:
++            self._write_text(handler, _STATUS_NOT_FOUND, "not found",
++                             head_only)
++
++    def _write_health(self, handler, head_only):
++        """Return 200 when empty, 503 when any Slot is held.
++
++        The body is a small JSON document with ``is_holding`` and
++        ``occupied`` so tooling that chooses to parse the response has the
++        data it needs without issuing a second request to ``/status``.
++        """
++        snapshot = self._slot_manager.snapshot()
++        holding = snapshot["is_holding"]
++        status = _STATUS_SERVICE_UNAVAILABLE if holding else _STATUS_OK
++        body = {
++            "status": "holding" if holding else "empty",
++            "is_holding": holding,
++            "occupied": snapshot["occupied"],
++            "total": snapshot["total"],
++            "available": snapshot["available"],
++            "drain_timeout_seconds": self._drain_timeout_seconds,
++        }
++        self._write_json(handler, status, body, head_only)
++
++    def _write_status(self, handler, head_only):
++        """Full machine-readable snapshot, always returns 200."""
++        snapshot = self._slot_manager.snapshot()
++        snapshot["drain_timeout_seconds"] = self._drain_timeout_seconds
++        self._write_json(handler, _STATUS_OK, snapshot, head_only)
++
++    # ---------------------------------------------------------------- helpers
++
++    def _write_json(self, handler, status, body, head_only):
++        payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
++        data = payload.encode("utf-8")
++        handler.send_response(status)
++        handler.send_header("Content-Type", _CONTENT_TYPE_JSON)
++        handler.send_header("Content-Length", str(len(data)))
++        handler.send_header("Connection", "close")
++        handler.end_headers()
++        if not head_only:
++            handler.wfile.write(data)
++
++    def _write_text(self, handler, status, text, head_only):
++        data = text.encode("utf-8")
++        handler.send_response(status)
++        handler.send_header("Content-Type", _CONTENT_TYPE_TEXT)
++        handler.send_header("Content-Length", str(len(data)))
++        handler.end_headers()
++        if not head_only:
++            handler.wfile.write(data)
++
++
++__all__ = ["HealthServer"]
+diff --git a/tests/test_slot.py b/tests/test_slot.py
+new file mode 100644
+index 0000000..c468e83
+--- /dev/null
++++ b/tests/test_slot.py
+@@ -0,0 +1,234 @@
++"""Tests for requests_toolbelt.slot.
++
++These tests focus on the two contracts that matter for Kubernetes graceful
++shutdown:
++
++* :class:`SlotManager` must expose an atomic, thread-safe snapshot of the
++  current occupancy (``is_holding`` / ``snapshot``).
++* :class:`HealthServer` must translate that snapshot into HTTP status codes
++  (200 when empty, 503 when at least one Slot is held).
++"""
++import json
++import threading
++import time
++
++import pytest
++
++try:
++    from urllib.request import urlopen, Request
++    from urllib.error import HTTPError
++except ImportError:  # pragma: no cover - Python 2 compat
++    from urllib2 import urlopen, Request, HTTPError  # type: ignore
++
++from requests_toolbelt.slot import HealthServer, SlotManager, TooManySlots
++
++
++# --------------------------------------------------------------------- utils
++
++def _get(url):
++    resp = urlopen(url)
++    return resp.status, json.loads(resp.read().decode("utf-8"))
++
++
++def _get_ignore_503(url):
++    try:
++        return _get(url)
++    except HTTPError as err:
++        return err.code, json.loads(err.read().decode("utf-8"))
++
++
++# --------------------------------------------------------------------- SlotManager
++
++def test_slot_manager_starts_empty():
++    s = SlotManager(total=4)
++    assert s.total == 4
++    assert s.occupied() == 0
++    assert s.available() == 4
++    assert s.is_holding() is False
++    assert s.snapshot()["is_holding"] is False
++
++
++def test_acquire_increments_occupancy():
++    s = SlotManager(total=4)
++    token = s.acquire()
++    assert s.occupied() == 1
++    assert s.is_holding() is True
++    assert s.snapshot()["occupied"] == 1
++    s.release(token)
++    assert s.is_holding() is False
++
++
++def test_acquire_as_context_manager_releases_on_exit():
++    s = SlotManager(total=4)
++    with s.acquire():
++        assert s.occupied() == 1
++    assert s.occupied() == 0
++
++
++def test_release_is_idempotent():
++    s = SlotManager(total=4)
++    token = s.acquire()
++    s.release(token)
++    s.release(token)  # must not raise / leak
++    s.release(None)
++    s.release("not-a-token")
++    assert s.occupied() == 0
++
++
++def test_too_many_slots_raises():
++    s = SlotManager(total=2)
++    t1 = s.acquire()
++    t2 = s.acquire()
++    with pytest.raises(TooManySlots):
++        s.acquire()
++    s.release(t1)
++    s.release(t2)
++
++
++def test_threaded_acquire_releases():
++    s = SlotManager(total=100)
++    errors = []
++
++    def run():
++        try:
++            for _ in range(50):
++                with s.acquire():
++                    time.sleep(0.001)
++        except Exception as exc:
++            errors.append(exc)
++
++    threads = [threading.Thread(target=run) for _ in range(10)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert errors == []
++    assert s.occupied() == 0
++    assert s.snapshot()["held_slots"] == []
++
++
++def test_snapshot_contains_held_seconds():
++    s = SlotManager(total=4)
++    with s.acquire():
++        snap = s.snapshot()
++        assert snap["total"] == 4
++        assert snap["available"] == 3
++        assert len(snap["held_slots"]) == 1
++        assert snap["held_slots"][0]["held_seconds"] >= 0
++
++
++# --------------------------------------------------------------------- HealthServer
++
++@pytest.fixture
++def server():
++    slots = SlotManager(total=4)
++    srv = HealthServer(slots, host="127.0.0.1", port=0,
++                       drain_timeout_seconds=5)
++    srv.start()
++    try:
++        yield srv, slots
++    finally:
++        srv.stop()
++
++
++def test_health_empty_returns_200(server):
++    srv, _ = server
++    status, body = _get("{}health".format(srv.url))
++    assert status == 200
++    assert body["status"] == "empty"
++    assert body["is_holding"] is False
++    assert body["occupied"] == 0
++
++
++def test_health_holding_returns_503(server):
++    srv, slots = server
++    token = slots.acquire()
++    try:
++        status, body = _get_ignore_503("{}health".format(srv.url))
++        assert status == 503
++        assert body["status"] == "holding"
++        assert body["is_holding"] is True
++        assert body["occupied"] == 1
++        assert body["drain_timeout_seconds"] == 5
++    finally:
++        slots.release(token)
++
++
++def test_ready_alias_matches_health(server):
++    srv, slots = server
++    with slots.acquire():
++        status, _ = _get_ignore_503("{}ready".format(srv.url))
++        assert status == 503
++
++
++def test_status_always_200_with_snapshot(server):
++    srv, slots = server
++    with slots.acquire():
++        status, body = _get("{}status".format(srv.url))
++        assert status == 200
++        assert body["is_holding"] is True
++        assert len(body["held_slots"]) == 1
++        assert body["drain_timeout_seconds"] == 5
++
++
++def test_unknown_path_returns_404(server):
++    srv, _ = server
++    status, _ = _get_ignore_503("{}does-not-exist".format(srv.url))
++    assert status == 404
++
++
++# --------------------------------------------------------------------- integration: k8s scale-down handshake
++
++def test_scale_down_handshake_releases_slot_and_becomes_ready(server):
++    """Simulate what happens during a Kubernetes graceful drain:
++
++    1. The Pod is holding one Slot -> /health returns 503 (NotReady).
++    2. The kubelet observes 503 and waits (keeps endpoints removed).
++    3. The work finishes and the Slot is released.
++    4. /health returns 200 and the Pod can be safely killed.
++    """
++    srv, slots = server
++    release_at = threading.Event()
++    done = threading.Event()
++
++    def work():
++        with slots.acquire():
++            release_at.wait(timeout=5)
++        done.set()
++
++    threading.Thread(target=work, daemon=True).start()
++
++    # Step 1+2: Pod still holds work -> 503
++    status, body = _get_ignore_503("{}health".format(srv.url))
++    assert status == 503, "should report holding while slot is held"
++    assert body["is_holding"] is True
++
++    # Step 3: finish work
++    release_at.set()
++    assert done.wait(timeout=5)
++
++    # Step 4: slot released -> 200
++    status, body = _get("{}health".format(srv.url))
++    assert status == 200
++    assert body["is_holding"] is False
++    assert body["occupied"] == 0
++
++
++def test_rejects_non_slotmanager():
++    with pytest.raises(TypeError):
++        HealthServer("not-a-slot-manager", port=0)
++
++
++def test_rejects_invalid_total():
++    with pytest.raises(ValueError):
++        SlotManager(total=0)
++    with pytest.raises(ValueError):
++        SlotManager(total="foo")
++
++
++def test_healthserver_context_manager():
++    slots = SlotManager(total=2)
++    with HealthServer(slots, host="127.0.0.1", port=0) as srv:
++        status, body = _get("{}health".format(srv.url))
++        assert status == 200
++        assert body["occupied"] == 0
