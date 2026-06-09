@@ -1,0 +1,388 @@
+diff --git a/cronJobFactory.example.ts b/cronJobFactory.example.ts
+new file mode 100644
+index 0000000..e1bcb88
+--- /dev/null
++++ b/cronJobFactory.example.ts
+@@ -0,0 +1,59 @@
++import { createCronJobFactory, CronJobConfig } from './cronJobFactory';
++
++const factory = createCronJobFactory({
++  checkIntervalMs: 30_000,
++  defaultTimezone: 'UTC',
++  onError: (jobId, error) => {
++    console.error(`[${new Date().toISOString()}] Job ${jobId} failed:`, error.message);
++  },
++  onRun: (jobId) => {
++    console.log(`[${new Date().toISOString()}] Job ${jobId} started`);
++  },
++});
++
++const job1Config: CronJobConfig = {
++  name: 'daily-report',
++  cronExpression: '0 9 * * *',
++  timezone: 'America/New_York',
++  handler: async () => {
++    console.log('Running daily report at 9 AM New York time');
++  },
++  maxRetries: 3,
++  retryDelayMs: 5000,
++};
++
++const job2Config: CronJobConfig = {
++  name: 'weekly-cleanup',
++  cronExpression: '30 2 * * 0',
++  timezone: 'Asia/Shanghai',
++  handler: () => {
++    console.log('Running weekly cleanup at 2:30 AM Shanghai time on Sunday');
++  },
++};
++
++const job3Config: CronJobConfig = {
++  name: 'every-5-minutes',
++  cronExpression: '*/5 * * * *',
++  handler: () => {
++    console.log('Running every 5 minutes (UTC)');
++  },
++};
++
++const job1 = factory.createJob(job1Config);
++const job2 = factory.createJob(job2Config);
++const job3 = factory.createJob(job3Config);
++
++console.log('Created jobs:');
++console.log(`- ${job1.id}: next run at ${job1.nextRunTime?.toISOString()}`);
++console.log(`- ${job2.id}: next run at ${job2.nextRunTime?.toISOString()}`);
++console.log(`- ${job3.id}: next run at ${job3.nextRunTime?.toISOString()}`);
++
++factory.start();
++
++console.log('Scheduler started. Press Ctrl+C to stop.');
++
++process.on('SIGINT', () => {
++  console.log('Stopping scheduler...');
++  factory.destroy();
++  process.exit(0);
++});
+diff --git a/cronJobFactory.ts b/cronJobFactory.ts
+new file mode 100644
+index 0000000..574ab27
+--- /dev/null
++++ b/cronJobFactory.ts
+@@ -0,0 +1,317 @@
++export interface CronJobConfig {
++  name: string;
++  cronExpression: string;
++  handler: () => Promise<void> | void;
++  timezone?: string;
++  enabled?: boolean;
++  maxRetries?: number;
++  retryDelayMs?: number;
++}
++
++export interface ParsedCronExpression {
++  minute: Set<number>;
++  hour: Set<number>;
++  dayOfMonth: Set<number>;
++  month: Set<number>;
++  dayOfWeek: Set<number>;
++  timezone: string;
++  rawExpression: string;
++}
++
++export interface TimeZoneAwareCronJob {
++  id: string;
++  config: CronJobConfig;
++  parsedExpression: ParsedCronExpression;
++  nextRunTime: Date | null;
++  lastRunTime: Date | null;
++  isRunning: boolean;
++  runCount: number;
++}
++
++export interface CronJobFactoryOptions {
++  checkIntervalMs?: number;
++  defaultTimezone?: string;
++  onError?: (jobId: string, error: Error) => void;
++  onRun?: (jobId: string) => void;
++}
++
++const VALID_TIMEZONES: Set<string> = new Set(
++  Intl.supportedValuesOf('timeZone')
++);
++
++const CRON_FIELD_RANGES = [
++  { name: 'minute', min: 0, max: 59 },
++  { name: 'hour', min: 0, max: 23 },
++  { name: 'dayOfMonth', min: 1, max: 31 },
++  { name: 'month', min: 1, max: 12 },
++  { name: 'dayOfWeek', min: 0, max: 6 },
++] as const;
++
++function parseCronField(field: string, min: number, max: number): Set<number> {
++  const result = new Set<number>();
++
++  if (field === '*') {
++    for (let i = min; i <= max; i++) {
++      result.add(i);
++    }
++    return result;
++  }
++
++  const parts = field.split(',');
++  for (const part of parts) {
++    if (part.includes('/')) {
++      const [range, stepStr] = part.split('/');
++      const step = parseInt(stepStr, 10);
++      const [startStr, endStr] = range.split('-');
++      const start = startStr === '*' ? min : parseInt(startStr, 10);
++      const end = endStr === undefined ? max : parseInt(endStr, 10);
++      for (let i = start; i <= end; i += step) {
++        result.add(i);
++      }
++    } else if (part.includes('-')) {
++      const [startStr, endStr] = part.split('-');
++      const start = parseInt(startStr, 10);
++      const end = parseInt(endStr, 10);
++      for (let i = start; i <= end; i++) {
++        result.add(i);
++      }
++    } else {
++      result.add(parseInt(part, 10));
++    }
++  }
++
++  return result;
++}
++
++function validateTimezone(timezone: string): boolean {
++  return VALID_TIMEZONES.has(timezone);
++}
++
++function parseCronExpression(expression: string, timezone: string): ParsedCronExpression {
++  const parts = expression.trim().split(/\s+/);
++  
++  if (parts.length !== 5) {
++    throw new Error(
++      `Invalid cron expression: "${expression}". Expected 5 fields, got ${parts.length}.`
++    );
++  }
++
++  if (!validateTimezone(timezone)) {
++    throw new Error(`Invalid timezone: "${timezone}"`);
++  }
++
++  const [minuteStr, hourStr, dayOfMonthStr, monthStr, dayOfWeekStr] = parts;
++
++  return {
++    minute: parseCronField(minuteStr, 0, 59),
++    hour: parseCronField(hourStr, 0, 23),
++    dayOfMonth: parseCronField(dayOfMonthStr, 1, 31),
++    month: parseCronField(monthStr, 1, 12),
++    dayOfWeek: parseCronField(dayOfWeekStr, 0, 6),
++    timezone,
++    rawExpression: expression,
++  };
++}
++
++function getTimeInTimezone(date: Date, timezone: string): {
++  minute: number;
++  hour: number;
++  dayOfMonth: number;
++  month: number;
++  dayOfWeek: number;
++} {
++  const formatter = new Intl.DateTimeFormat('en-US', {
++    timeZone: timezone,
++    minute: 'numeric',
++    hour: 'numeric',
++    hour12: false,
++    day: 'numeric',
++    month: 'numeric',
++    weekday: 'short',
++  });
++
++  const parts = formatter.formatToParts(date);
++  
++  const getPart = (type: string): number => {
++    const part = parts.find(p => p.type === type);
++    return part ? parseInt(part.value, 10) : 0;
++  };
++
++  const dayOfWeekMap: Record<string, number> = {
++    sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
++  };
++
++  const weekdayPart = parts.find(p => p.type === 'weekday');
++  const dayOfWeek = weekdayPart ? dayOfWeekMap[weekdayPart.value.toLowerCase().slice(0, 3)] : 0;
++
++  return {
++    minute: getPart('minute'),
++    hour: getPart('hour'),
++    dayOfMonth: getPart('day'),
++    month: getPart('month'),
++    dayOfWeek,
++  };
++}
++
++function matchesCronExpression(
++  time: { minute: number; hour: number; dayOfMonth: number; month: number; dayOfWeek: number },
++  parsed: ParsedCronExpression
++): boolean {
++  return (
++    parsed.minute.has(time.minute) &&
++    parsed.hour.has(time.hour) &&
++    parsed.dayOfMonth.has(time.dayOfMonth) &&
++    parsed.month.has(time.month) &&
++    parsed.dayOfWeek.has(time.dayOfWeek)
++  );
++}
++
++function calculateNextRunTime(parsed: ParsedCronExpression, from: Date = new Date()): Date {
++  const current = new Date(from);
++  const maxIterations = 366 * 24 * 60;
++  
++  for (let i = 1; i <= maxIterations; i++) {
++    current.setMinutes(current.getMinutes() + 1);
++    const timeInTz = getTimeInTimezone(current, parsed.timezone);
++    
++    if (matchesCronExpression(timeInTz, parsed)) {
++      return new Date(current);
++    }
++  }
++  
++  throw new Error('Could not calculate next run time within 1 year');
++}
++
++function generateId(name: string): string {
++  return `${name}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
++}
++
++export class CronJobFactory {
++  private jobs: Map<string, TimeZoneAwareCronJob> = new Map();
++  private intervalId: NodeJS.Timeout | null = null;
++  private options: Required<CronJobFactoryOptions>;
++
++  constructor(options: CronJobFactoryOptions = {}) {
++    this.options = {
++      checkIntervalMs: options.checkIntervalMs ?? 60_000,
++      defaultTimezone: options.defaultTimezone ?? 'UTC',
++      onError: options.onError ?? ((jobId, error) => console.error(`Job ${jobId} error:`, error)),
++      onRun: options.onRun ?? (() => {}),
++    };
++  }
++
++  createJob(config: CronJobConfig): TimeZoneAwareCronJob {
++    const timezone = config.timezone ?? this.options.defaultTimezone;
++    const parsedExpression = parseCronExpression(config.cronExpression, timezone);
++    const id = generateId(config.name);
++    const nextRunTime = calculateNextRunTime(parsedExpression);
++
++    const job: TimeZoneAwareCronJob = {
++      id,
++      config: {
++        ...config,
++        enabled: config.enabled ?? true,
++        maxRetries: config.maxRetries ?? 0,
++        retryDelayMs: config.retryDelayMs ?? 1000,
++      },
++      parsedExpression,
++      nextRunTime,
++      lastRunTime: null,
++      isRunning: false,
++      runCount: 0,
++    };
++
++    this.jobs.set(id, job);
++    return job;
++  }
++
++  removeJob(jobId: string): boolean {
++    return this.jobs.delete(jobId);
++  }
++
++  getJob(jobId: string): TimeZoneAwareCronJob | undefined {
++    return this.jobs.get(jobId);
++  }
++
++  getAllJobs(): TimeZoneAwareCronJob[] {
++    return Array.from(this.jobs.values());
++  }
++
++  async executeJob(jobId: string): Promise<void> {
++    const job = this.jobs.get(jobId);
++    if (!job || !job.config.enabled) {
++      return;
++    }
++
++    job.isRunning = true;
++    this.options.onRun(jobId);
++
++    try {
++      await job.config.handler();
++      job.lastRunTime = new Date();
++      job.runCount++;
++      job.nextRunTime = calculateNextRunTime(job.parsedExpression, new Date());
++    } catch (error) {
++      this.options.onError(jobId, error as Error);
++      await this.handleRetry(job, error as Error);
++    } finally {
++      job.isRunning = false;
++    }
++  }
++
++  private async handleRetry(job: TimeZoneAwareCronJob, error: Error): Promise<void> {
++    const maxRetries = job.config.maxRetries ?? 0;
++    const retryDelayMs = job.config.retryDelayMs ?? 1000;
++
++    for (let attempt = 1; attempt <= maxRetries; attempt++) {
++      await new Promise(resolve => setTimeout(resolve, retryDelayMs * attempt));
++      
++      try {
++        await job.config.handler();
++        job.lastRunTime = new Date();
++        job.runCount++;
++        job.nextRunTime = calculateNextRunTime(job.parsedExpression, new Date());
++        return;
++      } catch (retryError) {
++        this.options.onError(job.id, retryError as Error);
++      }
++    }
++  }
++
++  private checkJobs = async (): Promise<void> => {
++    const now = new Date();
++    
++    for (const job of this.jobs.values()) {
++      if (!job.config.enabled || job.isRunning || !job.nextRunTime) {
++        continue;
++      }
++
++      if (now >= job.nextRunTime) {
++        await this.executeJob(job.id);
++      }
++    }
++  };
++
++  start(): void {
++    if (this.intervalId) {
++      return;
++    }
++    this.intervalId = setInterval(this.checkJobs, this.options.checkIntervalMs);
++  }
++
++  stop(): void {
++    if (this.intervalId) {
++      clearInterval(this.intervalId);
++      this.intervalId = null;
++    }
++  }
++
++  destroy(): void {
++    this.stop();
++    this.jobs.clear();
++  }
++}
++
++export function createCronJobFactory(options?: CronJobFactoryOptions): CronJobFactory {
++  return new CronJobFactory(options);
++}
