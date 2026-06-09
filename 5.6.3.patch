@@ -1,0 +1,94 @@
+diff --git a/scripts/gen-vitest-workspace.ts b/scripts/gen-vitest-workspace.ts
+new file mode 100644
+index 0000000..0b7c222
+--- /dev/null
++++ b/scripts/gen-vitest-workspace.ts
+@@ -0,0 +1,69 @@
++import fs from 'fs';
++import path from 'path';
++
++const rootDir = path.resolve(__dirname, '..');
++const searchDirs = ['apps', 'packages'];
++
++function getViteProjects() {
++  const projects: string[] = [];
++  
++  for (const dir of searchDirs) {
++    const fullDirPath = path.join(rootDir, dir);
++    if (!fs.existsSync(fullDirPath)) continue;
++    
++    const subDirs = fs.readdirSync(fullDirPath, { withFileTypes: true });
++    for (const subDir of subDirs) {
++      if (subDir.isDirectory()) {
++        const viteConfigPath = path.join(fullDirPath, subDir.name, 'vite.config.ts');
++        if (fs.existsSync(viteConfigPath)) {
++          projects.push(`${dir}/${subDir.name}`);
++        }
++      }
++    }
++  }
++  
++  return projects;
++}
++
++function generateWorkspace() {
++  const projects = getViteProjects();
++  
++  let projectsConfig = '';
++  if (projects.length === 0) {
++    // Fallback template if no projects are found yet
++    projectsConfig = `  {
++    test: {
++      transformMode: {
++        ssr: [/\\.[jt]sx?$/],
++      },
++      setupFiles: ['ts-node/register'],
++    }
++  }`;
++  } else {
++    projectsConfig = projects.map(project => `  {
++    extends: './${project}/vite.config.ts',
++    test: {
++      name: '${project.split('/')[1]}',
++      root: './${project}',
++      transformMode: {
++        ssr: [/\\.[jt]sx?$/],
++      },
++      setupFiles: ['ts-node/register'],
++    },
++  }`).join(',\n');
++  }
++
++  const template = `// 自动生成的工作区配置文件，请勿直接修改
++import { defineWorkspace } from 'vitest/config';
++
++export default defineWorkspace([
++${projectsConfig}
++]);
++`;
++
++  const outputPath = path.join(rootDir, 'vitest.workspace.ts');
++  fs.writeFileSync(outputPath, template);
++  console.log('✅ 已成功生成 vitest.workspace.ts');
++}
++
++generateWorkspace();
+diff --git a/vitest.workspace.ts b/vitest.workspace.ts
+new file mode 100644
+index 0000000..918c88e
+--- /dev/null
++++ b/vitest.workspace.ts
+@@ -0,0 +1,13 @@
++// 自动生成的工作区配置文件，请勿直接修改
++import { defineWorkspace } from 'vitest/config';
++
++export default defineWorkspace([
++  {
++    test: {
++      transformMode: {
++        ssr: [/\.[jt]sx?$/],
++      },
++      setupFiles: ['ts-node/register'],
++    }
++  }
++]);
