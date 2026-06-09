@@ -1,0 +1,360 @@
+diff --git a/scripts/gen-vitest-workspace.ts b/scripts/gen-vitest-workspace.ts
+new file mode 100644
+index 0000000..a5aed78
+--- /dev/null
++++ b/scripts/gen-vitest-workspace.ts
+@@ -0,0 +1,207 @@
++import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
++import { dirname, isAbsolute, join, relative, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = dirname(__filename);
++
++export interface WorkspaceProject {
++  extends: string;
++  test: {
++    include?: string[];
++    exclude?: string[];
++    name: string;
++  };
++}
++
++export interface WorkspaceRoot {
++  test: {
++    transformMode: {
++      web?: RegExp[];
++      ssr?: RegExp[];
++    };
++    globals?: boolean;
++    reporters?: Array<"default" | "verbose" | "json" | "html" | string>;
++    threads?: boolean;
++    maxWorkers?: number | string;
++  };
++  projects: WorkspaceProject[];
++}
++
++const ROOT_DIR = resolve(__dirname, "..");
++const SCAN_ROOTS = ["apps", "packages"];
++const VITE_CONFIG_FILES = [
++  "vite.config.ts",
++  "vite.config.js",
++  "vite.config.mts",
++  "vite.config.mjs",
++  "vite.config.cts",
++  "vite.config.cjs",
++];
++const OUTPUT_FILE = join(ROOT_DIR, "vitest.workspace.ts");
++const DEFAULT_TEST_INCLUDES = [
++  "tests/**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs}",
++  "src/**/__tests__/**/*.{ts,tsx,js,jsx,mts,mjs}",
++  "src/**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs}",
++];
++const DEFAULT_TEST_EXCLUDES = [
++  "**/node_modules/**",
++  "**/dist/**",
++  "**/build/**",
++  "**/.next/**",
++  "**/.turbo/**",
++  "**/coverage/**",
++];
++
++function findPackageName(pkgDir: string): string {
++  const pkgJson = join(pkgDir, "package.json");
++  if (existsSync(pkgJson)) {
++    try {
++      const json = JSON.parse(readFileSync(pkgJson, "utf8"));
++      if (typeof json.name === "string" && json.name.length > 0) {
++        return json.name;
++      }
++    } catch {
++      // ignore parse error
++    }
++  }
++  return pkgDir.split(/[\\/]/).pop() || pkgDir;
++}
++
++function findViteConfig(dir: string): string | null {
++  for (const name of VITE_CONFIG_FILES) {
++    const candidate = join(dir, name);
++    if (existsSync(candidate) && statSync(candidate).isFile()) {
++      return candidate;
++    }
++  }
++  return null;
++}
++
++function walkScanRoots(): Array<{ pkgDir: string; viteConfig: string; name: string }> {
++  const results: Array<{ pkgDir: string; viteConfig: string; name: string }> = [];
++  const seen = new Set<string>();
++
++  for (const scanRoot of SCAN_ROOTS) {
++    const absScan = join(ROOT_DIR, scanRoot);
++    if (!existsSync(absScan) || !statSync(absScan).isDirectory()) {
++      continue;
++    }
++
++    for (const entry of readdirSync(absScan)) {
++      const pkgDir = join(absScan, entry);
++      if (!statSync(pkgDir).isDirectory()) continue;
++
++      const viteConfig = findViteConfig(pkgDir);
++      if (!viteConfig) continue;
++      if (seen.has(pkgDir)) continue;
++      seen.add(pkgDir);
++
++      results.push({
++        pkgDir,
++        viteConfig,
++        name: findPackageName(pkgDir),
++      });
++    }
++  }
++
++  results.sort((a, b) => a.name.localeCompare(b.name));
++  return results;
++}
++
++function toPosix(p: string): string {
++  return p.split("\\").join("/");
++}
++
++function relFromRoot(absPath: string): string {
++  const rel = relative(ROOT_DIR, absPath);
++  return toPosix(isAbsolute(rel) ? absPath : rel);
++}
++
++function buildWorkspaceConfig(): WorkspaceRoot {
++  const projectsInfo = walkScanRoots();
++  const projects: WorkspaceProject[] = projectsInfo.map(({ pkgDir, viteConfig, name }) => {
++    const relConfig = toPosix(relFromRoot(viteConfig));
++    const relDir = toPosix(relFromRoot(pkgDir));
++    const include = DEFAULT_TEST_INCLUDES.map((g) => `${relDir}/${g}`);
++    const exclude = DEFAULT_TEST_EXCLUDES.map((g) => `${relDir}/${g}`);
++    return {
++      extends: relConfig.startsWith(".") ? relConfig : `./${relConfig}`,
++      test: {
++        include,
++        exclude,
++        name,
++      },
++    };
++  });
++
++  return {
++    test: {
++      transformMode: {
++        ssr: [/\.[cm]?[tj]sx?$/],
++      },
++      globals: true,
++      reporters: ["default"],
++      threads: true,
++      maxWorkers: process.env.CI ? "50%" : "100%",
++    },
++    projects,
++  };
++}
++
++function serializeConfig(cfg: WorkspaceRoot): string {
++  const lines: string[] = [];
++  lines.push('import { defineWorkspace } from "vitest/config";');
++  lines.push("");
++  lines.push("export default defineWorkspace([");
++  lines.push("  {");
++  lines.push("    test: {");
++  lines.push("      transformMode: {");
++  lines.push("        ssr: [/\\.[cm]?[tj]sx?$/],");
++  lines.push("      },");
++  lines.push("      globals: true,");
++  lines.push('      reporters: ["default"],');
++  lines.push("      threads: true,");
++  lines.push(`      maxWorkers: process.env.CI ? "50%" : "100%",`);
++  lines.push("    },");
++  lines.push("  },");
++  for (const project of cfg.projects) {
++    lines.push("  {");
++    lines.push(`    extends: "${project.extends}",`);
++    lines.push("    test: {");
++    lines.push("      name: " + JSON.stringify(project.test.name) + ",");
++    if (project.test.include) {
++      lines.push("      include: " + JSON.stringify(project.test.include) + ",");
++    }
++    if (project.test.exclude) {
++      lines.push("      exclude: " + JSON.stringify(project.test.exclude) + ",");
++    }
++    lines.push("    },");
++    lines.push("  },");
++  }
++  lines.push("]);");
++  lines.push("");
++  return lines.join("\n");
++}
++
++function main(): void {
++  const cfg = buildWorkspaceConfig();
++  const outDir = dirname(OUTPUT_FILE);
++  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
++
++  const text = serializeConfig(cfg);
++  writeFileSync(OUTPUT_FILE, text, "utf8");
++
++  const count = cfg.projects.length;
++  console.log(`[gen-vitest-workspace] discovered ${count} project(s)`);
++  for (const p of cfg.projects) {
++    console.log(`  - ${p.test.name}  <- ${p.extends}`);
++  }
++  console.log(`[gen-vitest-workspace] written -> ${OUTPUT_FILE}`);
++}
++
++if (require.main === module || (import.meta as any).main) {
++  main();
++}
++
++export { walkScanRoots, buildWorkspaceConfig, main };
+diff --git a/tsconfig.vitest.json b/tsconfig.vitest.json
+new file mode 100644
+index 0000000..8789951
+--- /dev/null
++++ b/tsconfig.vitest.json
+@@ -0,0 +1,19 @@
++{
++  "extends": "./tsconfig.json",
++  "compilerOptions": {
++    "module": "commonjs",
++    "target": "ES2020",
++    "esModuleInterop": true,
++    "allowSyntheticDefaultImports": true,
++    "resolveJsonModule": true,
++    "types": ["node", "vitest/globals"],
++    "skipLibCheck": true
++  },
++  "include": [
++    "vitest.workspace.ts",
++    "scripts/**/*",
++    "apps/*/vite.config.ts",
++    "packages/*/vite.config.ts"
++  ],
++  "exclude": ["node_modules", "dist", "build"]
++}
+diff --git a/vitest.workspace.ts b/vitest.workspace.ts
+new file mode 100644
+index 0000000..3aa414e
+--- /dev/null
++++ b/vitest.workspace.ts
+@@ -0,0 +1,116 @@
++require("ts-node/register");
++
++const { defineWorkspace } = require("vitest/config");
++const fs = require("node:fs");
++const path = require("node:path");
++
++const ROOT_DIR = __dirname;
++const SCAN_ROOTS = ["apps", "packages"];
++const VITE_CONFIG_FILES = [
++  "vite.config.ts",
++  "vite.config.js",
++  "vite.config.mts",
++  "vite.config.mjs",
++  "vite.config.cts",
++  "vite.config.cjs",
++];
++const DEFAULT_INCLUDES = [
++  "tests/**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs}",
++  "src/**/__tests__/**/*.{ts,tsx,js,jsx,mts,mjs}",
++  "src/**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs}",
++];
++const DEFAULT_EXCLUDES = [
++  "**/node_modules/**",
++  "**/dist/**",
++  "**/build/**",
++  "**/.next/**",
++  "**/.turbo/**",
++  "**/coverage/**",
++];
++
++function toPosix(p) {
++  return p.split("\\").join("/");
++}
++
++function relFromRoot(abs) {
++  const rel = path.relative(ROOT_DIR, abs);
++  return toPosix(path.isAbsolute(rel) ? abs : rel);
++}
++
++function readPackageName(pkgDir) {
++  const pkgJson = path.join(pkgDir, "package.json");
++  if (fs.existsSync(pkgJson)) {
++    try {
++      const meta = JSON.parse(fs.readFileSync(pkgJson, "utf8"));
++      if (typeof meta.name === "string" && meta.name.length > 0) {
++        return meta.name;
++      }
++    } catch (_err) {
++      /* noop */
++    }
++  }
++  return pkgDir.split(/[\\/]/).pop() || pkgDir;
++}
++
++function findViteConfig(dir) {
++  for (const name of VITE_CONFIG_FILES) {
++    const candidate = path.join(dir, name);
++    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
++      return candidate;
++    }
++  }
++  return null;
++}
++
++function discoverProjects() {
++  const seen = new Set();
++  const items = [];
++
++  for (const scanRoot of SCAN_ROOTS) {
++    const absScan = path.join(ROOT_DIR, scanRoot);
++    if (!fs.existsSync(absScan) || !fs.statSync(absScan).isDirectory()) continue;
++
++    for (const entry of fs.readdirSync(absScan)) {
++      const pkgDir = path.join(absScan, entry);
++      if (!fs.statSync(pkgDir).isDirectory()) continue;
++
++      const viteConfig = findViteConfig(pkgDir);
++      if (!viteConfig) continue;
++      if (seen.has(pkgDir)) continue;
++      seen.add(pkgDir);
++
++      const relConfig = toPosix(relFromRoot(viteConfig));
++      const relDir = toPosix(relFromRoot(pkgDir));
++      const name = readPackageName(pkgDir);
++
++      items.push({
++        extends: relConfig.startsWith(".") ? relConfig : `./${relConfig}`,
++        test: {
++          name,
++          include: DEFAULT_INCLUDES.map((g) => `${relDir}/${g}`),
++          exclude: DEFAULT_EXCLUDES.map((g) => `${relDir}/${g}`),
++        },
++      });
++    }
++  }
++
++  items.sort((a, b) => a.test.name.localeCompare(b.test.name));
++  return items;
++}
++
++const projects = discoverProjects();
++
++module.exports = defineWorkspace([
++  {
++    test: {
++      transformMode: {
++        ssr: [/\.[cm]?[tj]sx?$/],
++      },
++      globals: true,
++      reporters: ["default"],
++      threads: true,
++      maxWorkers: process.env.CI ? "50%" : "100%",
++    },
++  },
++  ...projects,
++]);

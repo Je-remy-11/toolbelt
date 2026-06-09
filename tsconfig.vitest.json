@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2020",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "types": ["node", "vitest/globals"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "vitest.workspace.ts",
+    "scripts/**/*",
+    "apps/*/vite.config.ts",
+    "packages/*/vite.config.ts"
+  ],
+  "exclude": ["node_modules", "dist", "build"]
+}
