@@ -1,0 +1,283 @@
+diff --git a/app_setup.py b/app_setup.py
+new file mode 100644
+index 0000000..493764f
+--- /dev/null
++++ b/app_setup.py
+@@ -0,0 +1,276 @@
++"""
++Application bootstrap with Async Resource Manager (LIFO dispose pattern).
++
++====  原始 setup() 的 try...catch 资源清理漏洞分析  ====
++
++假设原始代码如下:
++
++    async def setup():
++        db = None; hsm = None; redis = None; server = None
++        try:
++            db    = await DB.connect()          # 1. DB 连接
++            hsm   = await HSM.init(db)          # 2. HSM (依赖 DB)
++            redis = await Redis.connect()       # 3. Redis
++            await run_migrations(db)            # 4. 数据库迁移
++            await run_seeds(db)                 # 5. 种子数据
++            server = Server(hsm, redis, db)     # 6. 应用服务
++            await main(server) or bootstrapCheck(server)
++        except Exception as e:
++            logger.error(e)
++        finally:
++            if hsm:   await hsm.close()
++            if redis: await redis.close()
++            if db:    await db.close()
++
++漏洞 #1 — 非 LIFO 顺序导致悬垂引用
++    DB 最先获取，最后关闭。HSM 依赖 DB，先被关闭。如果 HSM.close() 内部
++    需要访问 DB（例如刷新令牌、清理会话），DB 此时已被关闭 → 二次异常。
++    正确顺序应为: Server → Redis → HSM → DB (后获取的先释放)。
++
++漏洞 #2 — 中间失败导致已获资源泄露
++    await HSM.init(db) 成功, 但 await Redis.connect() 抛异常。
++    异常直接跳到 except/finally。finally 中 hsm 虽然会关闭，但若
++    hsm.close() 本身抛异常 (例如因 Redis 未就绪导致状态不一致)，
++    redis 和 db 的 close() 就不会执行 → DB 连接泄露。
++
++漏洞 #3 — 子异常打断清理链
++    finally 块中任何一个 .close() 抛异常，后续的 .close() 全部跳过，
++    造成连锁泄露。三行依次调用，第一行失败 = 后面两行全废。
++
++漏洞 #4 — UnboundLocalError / NameError
++    若 DB.connect() 即失败，hsm/redis/server 从未赋值，
++    finally 中引用它们会引发 NameError，覆盖了原始异常。
++
++漏洞 #5 — server 未被清理
++    main() / bootstrapCheck() 抛异常时，server 对象通常与
++    hsm/redis 不在同一抽象层，容易被遗忘关闭，导致端口占用、
++    gRPC channel 泄露等。
++
++====  重构方案: Dispose Pattern / Async Resource Manager  ====
++
++每个资源封装为 async context manager:  enter → acquire,  exit → release.
++用 contextlib.AsyncExitStack 构建 LIFO 栈:
++  进入顺序: DB → HSM → Redis → Migrations → Seeds → Server
++  退出顺序: Server → Seeds(无) → Migrations(无) → Redis → HSM → DB
++
++任意一步抛异常, 已入栈的资源按逆序安全释放, 单个 release 失败
++不会影响后续资源清理。
++"""
++
++from __future__ import annotations
++
++import logging
++from contextlib import AsyncExitStack, asynccontextmanager
++from typing import Any, AsyncIterator, Callable, List, Optional
++
++logger = logging.getLogger(__name__)
++
++
++# ======================================================================
++# 抽象接口层 (替换为你的实际 DB/HSM/Redis/Server SDK)
++# ======================================================================
++
++
++class DBService:
++    async def close(self) -> None:
++        logger.info("DB connection closed")
++
++    async def run_migrations(self) -> None:
++        logger.info("DB migrations applied")
++
++    async def run_seeds(self) -> None:
++        logger.info("DB seeds applied")
++
++
++class HSMService:
++    async def close(self) -> None:
++        logger.info("HSM session closed")
++
++
++class RedisService:
++    async def close(self) -> None:
++        logger.info("Redis connection closed")
++
++
++class ApplicationServer:
++    def __init__(self, db: DBService, hsm: HSMService, redis: RedisService) -> None:
++        self.db = db
++        self.hsm = hsm
++        self.redis = redis
++
++    async def close(self) -> None:
++        logger.info("Application server stopped")
++
++
++# 工厂函数 — 实际项目中替换为 DB.connect(), HSM.init(), Redis.connect()
++async def _connect_db() -> DBService:
++    logger.info("DB connected")
++    return DBService()
++
++
++async def _init_hsm(db: DBService) -> HSMService:
++    _ = db
++    logger.info("HSM initialized (depends on DB)")
++    return HSMService()
++
++
++async def _connect_redis() -> RedisService:
++    logger.info("Redis connected")
++    return RedisService()
++
++
++# ======================================================================
++# 防御式关闭: 单个 release 失败不影响其他资源
++# ======================================================================
++
++
++async def safe_close(resource: Any, name: str) -> None:
++    """吞掉子异常, 确保清理链不断."""
++    closer: Optional[Callable[[], Any]] = getattr(resource, "aclose", None)
++    if closer is None:
++        closer = getattr(resource, "close", None)
++    if closer is None:
++        return
++    try:
++        result = closer()
++        if hasattr(result, "__await__"):
++            await result
++    except Exception:
++        logger.exception(
++            "Failed to close %s (suppressed to keep releasing others)", name
++        )
++
++
++# ======================================================================
++# Async Context Manager: 每个资源一个 self-disposing factory
++# ======================================================================
++
++
++@asynccontextmanager
++async def managed_db() -> AsyncIterator[DBService]:
++    resource = await _connect_db()
++    try:
++        yield resource
++    finally:
++        await safe_close(resource, "DB")
++
++
++@asynccontextmanager
++async def managed_hsm(db: DBService) -> AsyncIterator[HSMService]:
++    resource = await _init_hsm(db)
++    try:
++        yield resource
++    finally:
++        await safe_close(resource, "HSM")
++
++
++@asynccontextmanager
++async def managed_redis() -> AsyncIterator[RedisService]:
++    resource = await _connect_redis()
++    try:
++        yield resource
++    finally:
++        await safe_close(resource, "Redis")
++
++
++@asynccontextmanager
++async def managed_server(
++    db: DBService, hsm: HSMService, redis: RedisService
++) -> AsyncIterator[ApplicationServer]:
++    server = ApplicationServer(db, hsm, redis)
++    try:
++        yield server
++    finally:
++        await safe_close(server, "Server")
++
++
++# ======================================================================
++# 业务入口 (占位, 替换为你的 main / bootstrapCheck)
++# ======================================================================
++
++
++async def main(server: ApplicationServer) -> None:
++    logger.info("main() running with server=%r", server)
++
++
++async def bootstrap_check(server: ApplicationServer) -> None:
++    logger.info("bootstrapCheck() ok for server=%r", server)
++
++
++# ======================================================================
++# 方案 A: AsyncExitStack — 推荐用法
++#
++# 进入顺序: DB → HSM → Redis → (Migrations/Seeds) → Server
++# 退出顺序: Server → Redis → HSM → DB
++#
++# 任何一步抛异常, 已入栈资源全部逆序安全释放.
++# ======================================================================
++
++
++async def setup() -> None:
++    async with AsyncExitStack() as exit_stack:
++        db: DBService = await exit_stack.enter_async_context(managed_db())
++        hsm: HSMService = await exit_stack.enter_async_context(managed_hsm(db))
++        redis: RedisService = await exit_stack.enter_async_context(managed_redis())
++
++        await db.run_migrations()
++        await db.run_seeds()
++
++        server: ApplicationServer = await exit_stack.enter_async_context(
++            managed_server(db, hsm, redis)
++        )
++
++        await bootstrap_check(server)
++        await main(server)
++
++
++# ======================================================================
++# 方案 B: 显式 LIFO 资源栈 — 便于向非 Python 开发者解释原理
++# ======================================================================
++
++
++class AsyncResourceManager:
++    """手动 LIFO 栈: push (resource, name), close_all 逆序释放."""
++
++    def __init__(self) -> None:
++        self._items: List[tuple[Any, str]] = []
++
++    async def __aenter__(self) -> "AsyncResourceManager":
++        return self
++
++    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
++        await self.close_all()
++
++    def register(self, resource: Any, name: str = "resource") -> Any:
++        self._items.append((resource, name))
++        return resource
++
++    async def close_all(self) -> None:
++        while self._items:
++            resource, name = self._items.pop()
++            await safe_close(resource, name)
++
++
++async def setup_explicit_lifo() -> None:
++    async with AsyncResourceManager() as stack:
++        db = stack.register(await _connect_db(), "DB")
++        hsm = stack.register(await _init_hsm(db), "HSM")
++        redis = stack.register(await _connect_redis(), "Redis")
++        await db.run_migrations()
++        await db.run_seeds()
++        server = stack.register(ApplicationServer(db, hsm, redis), "Server")
++        await bootstrap_check(server)
++        await main(server)
++
++
++# ======================================================================
++# 验证入口
++# ======================================================================
++
++if __name__ == "__main__":
++    import asyncio
++
++    logging.basicConfig(
++        level=logging.INFO, format="%(levelname)s %(message)s"
++    )
++    asyncio.run(setup())
+\ No newline at end of file
