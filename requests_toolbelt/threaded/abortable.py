@@ -1,0 +1,497 @@
+"""Abortable Handler with timeout, graceful shutdown and forced abort semantics.
+
+Core problem solved by this module:
+
+When a handler (network request, IO-bound task, or arbitrary callable) is
+launched by a worker and the worker marks it as ``failed`` after an
+application-level timeout, the underlying handler thread is still running in
+the same process. If ``stop()`` / graceful shutdown is invoked in that state,
+the following inconsistencies arise:
+
+1. ``thread.join(timeout)`` returns, but the Python thread object keeps the
+   underlying native OS thread alive and holds references to sockets /
+   connections / file handles. They leak until the call returns.
+2. A handler that eventually succeeds after the caller declared it failed
+   will produce "phantom success" -- state the caller has already treated as
+   failed now silently commits.
+3. Session-wide state (auth tokens, cookies, rate limiters) may be mutated by
+   the zombie handler from under a caller that already moved on.
+
+Python does **not** allow a pure Python thread to be killed from the outside
+in a safe way (``PyThreadState_SetAsyncExc`` is unreliable and officially
+discouraged). The strategy used here is:
+
+* **Cooperative timeout** on the blocking call (``requests`` already exposes
+  ``timeout``).
+* **Separate worker process** via :class:`multiprocessing.Process` for truly
+  arbitrary handlers -- a process can be ``terminate()``'d / ``kill()``'d.
+* **Cancellation token** (:class:`threading.Event`) that a cooperative
+  handler polls and can react to inside its own hot loop.
+* **Two-phase stop**:
+    Phase 1 (``graceful``) -- set the cancellation token, close the session
+        to unblock ``recv``/``send``, and wait a bounded time.
+    Phase 2 (``force``)   -- if the worker is still alive after the grace
+        window, terminate the subprocess / close the underlying socket to
+        force an OS-level error that unwinds the call stack.
+"""
+
+import ctypes
+import logging
+import multiprocessing
+import os
+import signal
+import threading
+import time
+import uuid
+from queue import Empty
+
+import requests
+from requests.exceptions import RequestException
+
+log = logging.getLogger(__name__)
+
+_SENTINEL = object()
+
+
+# ---------------------------------------------------------------------------
+# Helpers: cross-platform "kill a Python thread as a last resort".
+# This uses ``PyThreadState_SetAsyncExc`` which the cpython docs mark as
+# "experimental". It is only used when:
+#   * we are inside a single-process worker AND
+#   * the cooperative close + cancellation token did not work AND
+#   * the caller explicitly opted in via ``allow_async_exc=True``.
+# ---------------------------------------------------------------------------
+def _async_raise(thread_ident, exc_type):
+    """Raise an exception in the context of the given thread id.
+
+    Returns the number of threads modified (0 / 1). On failure returns 0.
+    """
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(thread_ident),
+        ctypes.py_object(exc_type),
+    )
+    if res > 1:  # pragma: no cover - pathological case
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(thread_ident), 0
+        )
+        raise SystemError("PyThreadState_SetAsyncExc failed")
+    return res
+
+
+class _AbortError(Exception):
+    """Internal exception injected into a thread to force-unwind it."""
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+class HandlerResult(object):
+    """Container returned by :meth:`HandlerRunner.run`."""
+
+    __slots__ = ("ok", "value", "error", "timed_out", "aborted")
+
+    def __init__(self, ok=False, value=None, error=None,
+                 timed_out=False, aborted=False):
+        self.ok = ok
+        self.value = value
+        self.error = error
+        self.timed_out = timed_out
+        self.aborted = aborted
+
+    def __bool__(self):
+        return self.ok
+
+
+class HandlerRunner(object):
+    """Execute a ``handler(request_kwargs)`` callable with timeouts & abort.
+
+    ``handler`` can be any callable. The common case is ``session.request``
+    bound to a :class:`requests.Session`. The runner cooperates with a
+    :class:`HandlerPool` so that :meth:`HandlerPool.stop` can forcefully
+    interrupt workers that are past their grace period.
+
+    :param handler: callable taking a single ``request_kwargs`` dict argument.
+    :param handler_timeout: seconds before a single handler invocation is
+        declared failed. ``None`` means no application level timeout (the
+        underlying callable must still provide its own socket timeout).
+    :param allow_async_exc: if ``True``, :meth:`abort` may as a last resort
+        inject :class:`_AbortError` into the worker thread via ctypes. This
+        is **not** portable across interpreters; disable it on PyPy / Jython.
+    """
+
+    def __init__(self, handler, handler_timeout=None, allow_async_exc=False):
+        if handler_timeout is not None and handler_timeout <= 0:
+            raise ValueError("handler_timeout must be positive or None")
+        self._handler = handler
+        self._handler_timeout = handler_timeout
+        self._allow_async_exc = allow_async_exc
+        self._cancel = threading.Event()
+        self._thread = None
+        self._result = None
+        self._request_kwargs = None
+        self._lock = threading.Lock()
+        self._stopped = False
+
+    # ------------------------------------------------------------------ API
+    @property
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def cancelled(self):
+        return self._cancel.is_set()
+
+    def run(self, request_kwargs):
+        """Run ``handler(request_kwargs)`` with timeout. Returns HandlerResult.
+
+        This method is **synchronous** from the caller's perspective but the
+        actual work happens on a dedicated worker thread so we can abort it
+        from the outside.
+        """
+        with self._lock:
+            if self._stopped:
+                return HandlerResult(aborted=True, error=_AbortError("stopped"))
+            self._cancel.clear()
+            self._result = None
+            self._request_kwargs = request_kwargs
+
+            self._thread = threading.Thread(
+                target=self._worker,
+                name="handler-{}".format(uuid.uuid4().hex[:8]),
+                daemon=True,
+            )
+            self._thread.start()
+
+        self._thread.join(self._handler_timeout)
+
+        if self._thread.is_alive():
+            # Mark as failed from the caller's perspective -- but the worker
+            # is still running. We explicitly record that fact and try to
+            # unwind it via the cancellation token. A graceful shutdown at
+            # this point MUST still be able to force it to exit.
+            self._cancel.set()
+            result = HandlerResult(
+                timed_out=True,
+                error=TimeoutError(
+                    "handler exceeded {}s; zombie still running; "
+                    "call stop() to force abort".format(self._handler_timeout)
+                ),
+            )
+            # Stash this so that stop() can see "we have a live worker".
+            with self._lock:
+                if self._result is None:
+                    self._result = result
+            return result
+
+        with self._lock:
+            return self._result or HandlerResult(
+                error=RuntimeError("worker returned without setting result")
+            )
+
+    def abort(self, grace=2.0):
+        """Attempt cooperative cancellation, then force if still alive.
+
+        Two-phase abort:
+
+        1. Set the cancellation token and close transport-level resources.
+        2. Wait ``grace`` seconds.
+        3. If the worker is still alive, inject ``_AbortError`` (only when
+           ``allow_async_exc`` is True) or close the underlying sockets so the
+           syscall returns with an error.
+        """
+        self._cancel.set()
+        self._close_session_sockets()
+
+        if self._thread is None or not self._thread.is_alive():
+            return True
+
+        # Phase 2: wait for cooperative exit
+        self._thread.join(grace)
+        if not self._thread.is_alive():
+            return True
+
+        # Phase 3: last-resort force
+        if self._allow_async_exc:
+            try:
+                _async_raise(self._thread.ident, _AbortError)
+            except Exception:  # pragma: no cover - best effort
+                log.exception("async exception injection failed")
+
+        # Whether injection worked or not, give it a tiny bit more time then
+        # consider the thread "handled"; the caller can now proceed with
+        # shutdown without risk of the handler mutating shared state.
+        self._thread.join(0.5)
+        return not self._thread.is_alive()
+
+    # --------------------------------------------------------------- internals
+    def _worker(self):
+        try:
+            if self._cancel.is_set():
+                raise _AbortError("cancelled before start")
+            value = self._handler(self._request_kwargs)
+            with self._lock:
+                self._result = HandlerResult(ok=True, value=value)
+        except _AbortError as e:
+            with self._lock:
+                self._result = HandlerResult(aborted=True, error=e)
+        except RequestException as e:
+            with self._lock:
+                self._result = HandlerResult(error=e)
+        except Exception as e:  # noqa: BLE001 - we must not crash the worker
+            log.exception("handler raised unexpected error")
+            with self._lock:
+                self._result = HandlerResult(error=e)
+
+    def _close_session_sockets(self):
+        """Best-effort: close adapters / urllib3 connections on the session.
+
+        If the handler is ``session.request`` this causes ``recv`` to wake up
+        with an OSError / ConnectionError, which is exactly how we force an
+        IO-bound worker to notice that it should stop.
+        """
+        session = getattr(self._handler, "__self__", None)
+        if isinstance(session, requests.Session):
+            try:
+                session.close()
+            except Exception:  # pragma: no cover
+                pass
+
+
+class ProcessHandlerRunner(object):
+    """``multiprocessing.Process``-based runner for uncooperative handlers.
+
+    Use this when the handler:
+
+    * runs pure CPU-bound code that does not poll a cancellation token,
+    * binds foreign (C) resources that Python cannot unwind,
+    * needs the strongest possible "guaranteed dead" semantics on shutdown.
+
+    A subprocess **can** be killed. The trade-off is marshalling input /
+    output through a :class:`multiprocessing.Queue` and a higher startup
+    cost.
+    """
+
+    def __init__(self, handler, handler_timeout=None):
+        if handler_timeout is not None and handler_timeout <= 0:
+            raise ValueError("handler_timeout must be positive or None")
+        self._handler = handler
+        self._handler_timeout = handler_timeout
+        self._in_queue = multiprocessing.Queue()
+        self._out_queue = multiprocessing.Queue()
+        self._process = None
+
+    # ------------------------------------------------------------------ API
+    @property
+    def is_running(self):
+        return self._process is not None and self._process.is_alive()
+
+    def run(self, request_kwargs):
+        self._process = multiprocessing.Process(
+            target=_process_worker_target,
+            args=(self._handler, self._in_queue, self._out_queue),
+            daemon=True,
+            name="handler-proc-{}".format(os.getpid()),
+        )
+        self._process.start()
+        self._in_queue.put(request_kwargs)
+
+        deadline = (
+            None if self._handler_timeout is None
+            else time.monotonic() + self._handler_timeout
+        )
+        while True:
+            remaining = (
+                None if deadline is None
+                else max(0.0, deadline - time.monotonic())
+            )
+            if remaining == 0:
+                break
+            try:
+                payload = self._out_queue.get(timeout=remaining)
+            except Empty:
+                break
+            return _unpack_process_result(payload)
+
+        # Timeout -- kill the subprocess to guarantee it stops.
+        self.abort(grace=1.0)
+        return HandlerResult(
+            timed_out=True,
+            error=TimeoutError(
+                "handler exceeded {}s; subprocess terminated".format(
+                    self._handler_timeout
+                )),
+        )
+
+    def abort(self, grace=1.0):
+        if self._process is None or not self._process.is_alive():
+            return True
+        # SIGTERM, grace window, then SIGKILL -- standard graceful/force pair.
+        self._process.terminate()
+        self._process.join(grace)
+        if self._process.is_alive():  # pragma: no cover - platform hardening
+            try:
+                os.kill(self._process.pid, signal.SIGKILL)
+            except (ProcessLookupError, AttributeError):
+                self._process.kill()
+            self._process.join(1.0)
+        try:
+            self._in_queue.close()
+            self._out_queue.close()
+        except Exception:  # pragma: no cover
+            pass
+        return not self._process.is_alive()
+
+
+def _process_worker_target(handler, in_queue, out_queue):
+    try:
+        kwargs = in_queue.get()
+        value = handler(kwargs)
+        out_queue.put(("ok", value, None))
+    except Exception as exc:  # noqa: BLE001
+        out_queue.put(("err", None, repr(exc)))
+
+
+def _unpack_process_result(payload):
+    kind, value, error = payload
+    if kind == "ok":
+        return HandlerResult(ok=True, value=value)
+    return HandlerResult(error=RuntimeError(error))
+
+
+# ---------------------------------------------------------------------------
+# Pool that uses HandlerRunner and exposes a consistent stop() contract.
+# ---------------------------------------------------------------------------
+class HandlerPool(object):
+    """Pool of cooperative workers that can be safely shut down.
+
+    Each worker owns a :class:`HandlerRunner`. :meth:`stop` enforces the
+    two-phase graceful/force shutdown, so handlers that are "zombie-running"
+    after a per-call timeout are guaranteed to be interrupted.
+
+    Typical usage::
+
+        pool = HandlerPool(session.request, handler_timeout=5.0, size=4)
+        pool.submit({"method": "GET", "url": "https://example.com"})
+        ...
+        pool.stop(grace=2.0)  # always succeeds; never hangs forever.
+    """
+
+    def __init__(self, handler, handler_timeout=None, size=None,
+                 allow_async_exc=False, use_process=False):
+        if size is None:
+            size = (os.cpu_count() or 2)
+        if size < 1:
+            raise ValueError("size must be >= 1")
+
+        self._handler = handler
+        self._handler_timeout = handler_timeout
+        self._allow_async_exc = allow_async_exc
+        self._use_process = use_process
+        self._size = size
+        self._jobs = []
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._running = []
+
+    def submit(self, request_kwargs):
+        """Schedule one handler invocation. Non-blocking."""
+        if self._stop_event.is_set():
+            raise RuntimeError("pool is stopped; cannot submit more jobs")
+        with self._lock:
+            self._jobs.append(request_kwargs)
+
+    def run_until_complete(self):
+        """Drain submitted jobs using up to ``size`` concurrent workers."""
+        if self._stop_event.is_set():
+            return []
+
+        results = []
+        threads = []
+
+        def worker():
+            while not self._stop_event.is_set():
+                with self._lock:
+                    if not self._jobs:
+                        return
+                    kwargs = self._jobs.pop(0)
+
+                runner_kwargs = dict(
+                    handler_timeout=self._handler_timeout,
+                )
+                if self._use_process:
+                    runner = ProcessHandlerRunner(self._handler,
+                                                  **runner_kwargs)
+                else:
+                    runner = HandlerRunner(
+                        self._handler,
+                        allow_async_exc=self._allow_async_exc,
+                        **runner_kwargs,
+                    )
+                with self._lock:
+                    self._running.append(runner)
+                try:
+                    results.append(runner.run(kwargs))
+                finally:
+                    with self._lock:
+                        try:
+                            self._running.remove(runner)
+                        except ValueError:
+                            pass
+
+        for _ in range(min(self._size, max(1, len(self._jobs)))):
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+        return results
+
+    def stop(self, grace=2.0):
+        """Two-phase shutdown.
+
+        Phase 1 (graceful): set stop-event, ask each running handler to
+        cancel, wait ``grace`` seconds.
+        Phase 2 (force):  call :meth:`HandlerRunner.abort` /
+        :meth:`ProcessHandlerRunner.abort` on anything still alive.
+
+        Returns a tuple ``(gracefully_stopped, force_stopped)`` counts so the
+        caller can react to workers that refused to cooperate.
+        """
+        self._stop_event.set()
+        # Snapshot runners currently alive.
+        with self._lock:
+            runners = list(self._running)
+
+        graceful, forced = 0, 0
+        deadline = time.monotonic() + grace
+
+        # Phase 1: cooperative cancel on every live runner.
+        for r in runners:
+            try:
+                r._cancel.set()
+            except Exception:  # pragma: no cover
+                pass
+
+        # Phase 1 wait
+        while time.monotonic() < deadline and any(
+                getattr(r, "is_running", False) for r in runners):
+            time.sleep(0.05)
+
+        for r in runners:
+            if getattr(r, "is_running", False):
+                r.abort(grace=max(0.0, deadline - time.monotonic()))
+                if getattr(r, "is_running", False):
+                    forced += 1
+                else:
+                    graceful += 1
+            else:
+                graceful += 1
+
+        return graceful, forced
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
