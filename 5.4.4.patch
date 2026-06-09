@@ -1,0 +1,367 @@
+diff --git a/cronJobFactory.ts b/cronJobFactory.ts
+new file mode 100644
+index 0000000..d9a65f8
+--- /dev/null
++++ b/cronJobFactory.ts
+@@ -0,0 +1,231 @@
++import { parseCronPattern } from './cronParser';
++import type { CronFields, CronJobConfig, CronJobInstance } from './types';
++
++interface TzDateTime {
++  year: number;
++  month: number;
++  day: number;
++  hour: number;
++  minute: number;
++  second: number;
++  weekday: number;
++  toUTC(): Date;
++  addMinutes(n: number): TzDateTime;
++  clone(): TzDateTime;
++}
++
++class TzDateTimeImpl implements TzDateTime {
++  year: number;
++  month: number;
++  day: number;
++  hour: number;
++  minute: number;
++  second: number;
++  weekday: number;
++  private timezone: string;
++
++  constructor(date: Date, timezone: string) {
++    this.timezone = timezone;
++    const parts = getTimezoneParts(date, timezone);
++    this.year = parts.year;
++    this.month = parts.month;
++    this.day = parts.day;
++    this.hour = parts.hour;
++    this.minute = parts.minute;
++    this.second = parts.second;
++    this.weekday = parts.weekday;
++  }
++
++  clone(): TzDateTime {
++    const d = new Date(this.toUTC().getTime());
++    return new TzDateTimeImpl(d, this.timezone);
++  }
++
++  toUTC(): Date {
++    const probeMs = Date.UTC(this.year, this.month - 1, this.day, 12, 0, 0);
++    const probeDate = new Date(probeMs);
++    const parts = getTimezoneParts(probeDate, this.timezone);
++
++    const localInterp = Date.UTC(
++      parts.year,
++      parts.month - 1,
++      parts.day,
++      parts.hour,
++      parts.minute,
++      0
++    );
++    const offsetMs = localInterp - probeMs;
++
++    const targetAsUtc = Date.UTC(
++      this.year,
++      this.month - 1,
++      this.day,
++      this.hour,
++      this.minute,
++      0
++    );
++
++    return new Date(targetAsUtc - offsetMs);
++  }
++
++  addMinutes(n: number): TzDateTime {
++    let ms = this.toUTC().getTime();
++    if (isNaN(ms)) return this;
++    ms += n * 60000;
++    return new TzDateTimeImpl(new Date(ms), this.timezone);
++  }
++}
++
++function getTimezoneParts(date: Date, timezone: string): {
++  year: number;
++  month: number;
++  day: number;
++  hour: number;
++  minute: number;
++  second: number;
++  weekday: number;
++} {
++  const fmt = new Intl.DateTimeFormat('en-US', {
++    timeZone: timezone,
++    year: 'numeric',
++    month: '2-digit',
++    day: '2-digit',
++    hour: '2-digit',
++    minute: '2-digit',
++    second: '2-digit',
++    weekday: 'short',
++    hour12: false,
++  });
++  const parts = fmt.formatToParts(date);
++  const map: Record<string, string> = {};
++  for (const p of parts) {
++    if (p.type !== 'literal') {
++      map[p.type] = p.value;
++    }
++  }
++
++  const weekdayMap: Record<string, number> = {
++    Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
++  };
++
++  return {
++    year: parseInt(map.year, 10),
++    month: parseInt(map.month, 10),
++    day: parseInt(map.day, 10),
++    hour: parseInt(map.hour, 10),
++    minute: parseInt(map.minute, 10),
++    second: parseInt(map.second, 10),
++    weekday: weekdayMap[map.weekday] ?? 0,
++  };
++}
++
++function createTzDateTime(date: Date, timezone: string): TzDateTime {
++  return new TzDateTimeImpl(date, timezone);
++}
++
++function isCronMatch(dt: TzDateTime, fields: CronFields): boolean {
++  if (!fields.minute.includes(dt.minute)) return false;
++  if (!fields.hour.includes(dt.hour)) return false;
++  if (!fields.month.includes(dt.month)) return false;
++
++  const domMatch = fields.dayOfMonth.includes(dt.day);
++  const dowMatch = fields.dayOfWeek.includes(dt.weekday);
++
++  return domMatch && dowMatch;
++}
++
++function findNextMatchingMinute(from: TzDateTime, fields: CronFields): TzDateTime | null {
++  let current = from.clone();
++
++  for (let day = 0; day < 366; day++) {
++    for (let minute = 0; minute < 1440; minute++) {
++      if (isCronMatch(current, fields)) {
++        return current;
++      }
++      current = current.addMinutes(1);
++    }
++  }
++
++  return null;
++}
++
++function findNextRun(fields: CronFields, timezone: string, fromDate: Date): Date | null {
++  const tzNow = createTzDateTime(fromDate, timezone);
++  const nextMin = tzNow.addMinutes(1);
++
++  const next = findNextMatchingMinute(nextMin, fields);
++  if (!next) return null;
++
++  return next.toUTC();
++}
++
++export function createCronJob(config: CronJobConfig): CronJobInstance {
++  const { pattern, callback, runOnInit = false, errorHandler } = config;
++
++  const parsed = parseCronPattern(pattern);
++  const { fields, timezone } = parsed;
++
++  let timeoutId: ReturnType<typeof setTimeout> | null = null;
++  let running = false;
++  let nextRunDate: Date | null = null;
++
++  const execute = async () => {
++    try {
++      await callback();
++    } catch (err) {
++      if (errorHandler) {
++        errorHandler(err instanceof Error ? err : new Error(String(err)));
++      }
++    }
++  };
++
++  const scheduleNext = () => {
++    if (!running) return;
++
++    const now = new Date();
++    const next = findNextRun(fields, timezone, now);
++
++    if (!next) {
++      nextRunDate = null;
++      return;
++    }
++
++    nextRunDate = next;
++    const delay = next.getTime() - Date.now();
++
++    timeoutId = setTimeout(async () => {
++      await execute();
++      scheduleNext();
++    }, Math.max(0, delay));
++  };
++
++  const start = () => {
++    if (running) return;
++    running = true;
++
++    if (runOnInit) {
++      execute().then(() => scheduleNext());
++    } else {
++      scheduleNext();
++    }
++  };
++
++  const stop = () => {
++    running = false;
++    if (timeoutId !== null) {
++      clearTimeout(timeoutId);
++      timeoutId = null;
++    }
++    nextRunDate = null;
++  };
++
++  const nextRun = (): Date | null => nextRunDate;
++  const isRunning = (): boolean => running;
++
++  return {
++    start,
++    stop,
++    nextRun,
++    isRunning,
++  };
++}
+\ No newline at end of file
+diff --git a/cronParser.ts b/cronParser.ts
+new file mode 100644
+index 0000000..04e4d37
+--- /dev/null
++++ b/cronParser.ts
+@@ -0,0 +1,87 @@
++import type { CronFields, ParsedCronExpression } from './types';
++
++export const DEFAULT_TIMEZONE = 'UTC';
++
++function expandWildcard(start: number, end: number, step = 1): number[] {
++  const result: number[] = [];
++  for (let i = start; i <= end; i += step) {
++    result.push(i);
++  }
++  return result;
++}
++
++function parseField(field: string, min: number, max: number): number[] {
++  if (field === '*') {
++    return expandWildcard(min, max);
++  }
++
++  if (field.includes(',')) {
++    const parts = field.split(',');
++    return parts.flatMap(p => parseField(p, min, max));
++  }
++
++  if (field.includes('/')) {
++    const [range, stepStr] = field.split('/');
++    const step = parseInt(stepStr, 10);
++    if (range === '*') {
++      return expandWildcard(min, max, step);
++    }
++    const parts = range.split('-');
++    const start = parseInt(parts[0], 10);
++    const end = parts.length > 1 ? parseInt(parts[1], 10) : max;
++    return expandWildcard(isNaN(start) ? min : start, isNaN(end) ? max : end, step);
++  }
++
++  if (field.includes('-')) {
++    const [startStr, endStr] = field.split('-');
++    const start = parseInt(startStr, 10);
++    const end = parseInt(endStr, 10);
++    return expandWildcard(start, end);
++  }
++
++  const value = parseInt(field, 10);
++  return [value];
++}
++
++function isValidTimezone(timezone: string): boolean {
++  try {
++    Intl.DateTimeFormat(undefined, { timeZone: timezone });
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++export function parseCronPattern(pattern: string): ParsedCronExpression {
++  const parts = pattern.trim().split(/\s+/);
++
++  let timezone = DEFAULT_TIMEZONE;
++  let fields: string[];
++
++  if (parts.length >= 6 && isValidTimezone(parts[5])) {
++    timezone = parts[5];
++    fields = parts.slice(0, 5);
++  } else if (parts.length >= 5) {
++    fields = parts.slice(0, 5);
++  } else {
++    throw new Error(
++      `Invalid cron pattern: "${pattern}". Expected at least 5 fields (minute hour day month dow), optionally followed by a timezone.`
++    );
++  }
++
++  const [minute, hour, dom, month, dow] = fields;
++
++  const parsed: CronFields = {
++    minute: Array.from(new Set(parseField(minute, 0, 59))).sort((a, b) => a - b),
++    hour: Array.from(new Set(parseField(hour, 0, 23))).sort((a, b) => a - b),
++    dayOfMonth: Array.from(new Set(parseField(dom, 1, 31))).sort((a, b) => a - b),
++    month: Array.from(new Set(parseField(month, 0, 11))).sort((a, b) => a - b),
++    dayOfWeek: Array.from(new Set(parseField(dow, 0, 6))).sort((a, b) => a - b),
++  };
++
++  return {
++    fields: parsed,
++    timezone,
++    raw: pattern,
++  };
++}
+\ No newline at end of file
+diff --git a/types.ts b/types.ts
+new file mode 100644
+index 0000000..fbd6fa9
+--- /dev/null
++++ b/types.ts
+@@ -0,0 +1,28 @@
++export interface CronFields {
++  minute: number[];
++  hour: number[];
++  dayOfMonth: number[];
++  month: number[];
++  dayOfWeek: number[];
++}
++
++export interface ParsedCronExpression {
++  fields: CronFields;
++  timezone: string;
++  raw: string;
++}
++
++export interface CronJobConfig {
++  pattern: string;
++  callback: () => void | Promise<void>;
++  name?: string;
++  runOnInit?: boolean;
++  errorHandler?: (err: Error) => void;
++}
++
++export interface CronJobInstance {
++  start: () => void;
++  stop: () => void;
++  nextRun: () => Date | null;
++  isRunning: () => boolean;
++}
+\ No newline at end of file
