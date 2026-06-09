@@ -1,0 +1,986 @@
+diff --git a/5.7.4.patch b/5.7.4.patch
+new file mode 100644
+index 0000000..3fc754e
+--- /dev/null
++++ b/5.7.4.patch
+@@ -0,0 +1,490 @@
++diff --git a/slot_health_endpoint.py b/slot_health_endpoint.py
++new file mode 100644
++index 0000000..a1b2c3d
++--- /dev/null
+++++ b/slot_health_endpoint.py
++@@ -0,0 +1,415 @@
+++"""
+++Slot Health Endpoint - 将 Slot 占用状态暴露为 HTTP /health 端点
+++
+++设计目标:
+++    让 Kubernetes 在 Pod 缩容时能准确判断该 Pod 是否还在持有 Slot，
+++    从而避免流量损失。
+++
+++核心概念:
+++    - Slot: 表示一个工作槽位（如连接、任务、请求处理单元）
+++    - drainTimeoutMs: 排空超时时间，需小于 K8s terminationGracePeriodSeconds
+++    - 当 K8s 发送 SIGTERM 时，Pod 进入 drain 模式，不再接受新 Slot，
+++      等待已有 Slot 释放或超时后退出
+++
+++K8s 集成方式:
+++    - readinessProbe  -> /health/ready  (判断是否可接收新流量)
+++    - livenessProbe   -> /health/live   (判断进程是否存活)
+++    - lifecycle.preStop -> 触发 drain 模式
+++
+++端点说明:
+++    - GET /health            -> 综合健康状态
+++    - GET /health/ready      -> 就绪探针: drain 中返回 503
+++    - GET /health/live       -> 存活探针: 始终 200 (除非死锁)
+++    - GET /health/slot-status -> 详细 Slot 占用信息 (JSON)
+++"""
+++
+++import json
+++import logging
+++import signal
+++import threading
+++import time
+++from http.server import HTTPServer, BaseHTTPRequestHandler
+++from datetime import datetime, timezone
+++
+++logger = logging.getLogger(__name__)
+++
+++DEFAULT_DRAIN_TIMEOUT_MS = 25000
+++DEFAULT_HEALTH_PORT = 8090
+++K8S_GRACE_PERIOD_BUFFER_MS = 5000
+++
+++
+++class Slot:
+++    """单个 Slot 的占用记录"""
+++
+++    __slots__ = ("slot_id", "acquired_at", "metadata", "owner")
+++
+++    def __init__(self, slot_id, owner=None, metadata=None):
+++        self.slot_id = slot_id
+++        self.owner = owner
+++        self.metadata = metadata or {}
+++        self.acquired_at = time.monotonic()
+++
+++    def hold_duration_ms(self):
+++        return int((time.monotonic() - self.acquired_at) * 1000)
+++
+++    def to_dict(self):
+++        return {
+++            "slot_id": self.slot_id,
+++            "owner": self.owner,
+++            "metadata": self.metadata,
+++            "acquired_at_utc": datetime.fromtimestamp(
+++                self.acquired_at, tz=timezone.utc
+++            ).isoformat(),
+++            "hold_duration_ms": self.hold_duration_ms(),
+++        }
+++
+++
+++class SlotManager:
+++    """
+++    Slot 管理器 - 跟踪 Slot 的获取与释放
+++
+++    drainTimeoutMs 的设计:
+++        K8s Pod 终止流程:
+++        1. K8s 标记 Pod 为 Terminating
+++        2. 同时执行 preStop hook (如果配置)
+++        3. 等待 terminationGracePeriodSeconds 后发送 SIGKILL
+++
+++        drainTimeoutMs 应满足:
+++            drainTimeoutMs < terminationGracePeriodSeconds * 1000 - K8S_GRACE_PERIOD_BUFFER_MS
+++
+++        这样确保在 K8s 强制杀死 Pod 之前，drain 逻辑有机会完成清理。
+++    """
+++
+++    def __init__(self, max_slots=0, drain_timeout_ms=DEFAULT_DRAIN_TIMEOUT_MS):
+++        self._slots = {}
+++        self._lock = threading.Lock()
+++        self._max_slots = max_slots
+++        self._drain_timeout_ms = drain_timeout_ms
+++        self._draining = False
+++        self._drain_started_at = None
+++        self._drain_event = threading.Event()
+++        self._slot_counter = 0
+++
+++    @property
+++    def drain_timeout_ms(self):
+++        return self._drain_timeout_ms
+++
+++    @property
+++    def draining(self):
+++        return self._draining
+++
+++    @property
+++    def drain_started_at(self):
+++        return self._drain_started_at
+++
+++    def acquire(self, owner=None, metadata=None):
+++        """
+++        获取一个 Slot。drain 模式下拒绝新获取。
+++
+++        Returns:
+++            Slot: 成功获取的 Slot 对象
+++            None: drain 模式下或 Slot 已满时返回 None
+++        """
+++        with self._lock:
+++            if self._draining:
+++                logger.debug("Slot acquire rejected: draining in progress")
+++                return None
+++            if self._max_slots > 0 and len(self._slots) >= self._max_slots:
+++                logger.debug("Slot acquire rejected: max slots reached")
+++                return None
+++            self._slot_counter += 1
+++            slot = Slot(slot_id=self._slot_counter, owner=owner, metadata=metadata)
+++            self._slots[slot.slot_id] = slot
+++            logger.debug("Slot %d acquired by %s", slot.slot_id, owner)
+++            return slot
+++
+++    def release(self, slot_id):
+++        """
+++        释放一个 Slot。如果 drain 模式下所有 Slot 已释放，通知等待线程。
+++        """
+++        with self._lock:
+++            slot = self._slots.pop(slot_id, None)
+++            if slot is None:
+++                logger.warning("Slot %d release failed: not found", slot_id)
+++                return False
+++            logger.debug("Slot %d released by %s", slot.slot_id, slot.owner)
+++            if self._draining and len(self._slots) == 0:
+++                self._drain_event.set()
+++        return True
+++
+++    def start_drain(self):
+++        """
+++        进入 drain 模式。不再接受新 Slot，等待已有 Slot 释放。
+++
+++        Returns:
+++            bool: True 表示所有 Slot 在超时前释放; False 表示超时
+++        """
+++        with self._lock:
+++            if self._draining:
+++                logger.debug("Drain already in progress")
+++                return True
+++            self._draining = True
+++            self._drain_started_at = time.monotonic()
+++            remaining = len(self._slots)
+++            if remaining == 0:
+++                logger.info("Drain started: no slots held, immediate completion")
+++                self._drain_event.set()
+++                return True
+++            logger.info(
+++                "Drain started: %d slots held, timeout=%dms",
+++                remaining,
+++                self._drain_timeout_ms,
+++            )
+++
+++        timeout_sec = self._drain_timeout_ms / 1000.0
+++        completed = self._drain_event.wait(timeout=timeout_sec)
+++
+++        if completed:
+++            logger.info("Drain completed: all slots released within timeout")
+++        else:
+++            with self._lock:
+++                remaining = len(self._slots)
+++            logger.warning(
+++                "Drain timed out after %dms: %d slots still held",
+++                self._drain_timeout_ms,
+++                remaining,
+++            )
+++        return completed
+++
+++    def get_status(self):
+++        """
+++        获取当前 Slot 状态摘要，用于 /health 端点返回。
+++        """
+++        with self._lock:
+++            slots_info = [s.to_dict() for s in self._slots.values()]
+++            drain_elapsed_ms = 0
+++            if self._draining and self._drain_started_at is not None:
+++                drain_elapsed_ms = int(
+++                    (time.monotonic() - self._drain_started_at) * 1000
+++                )
+++            return {
+++                "total_slots_held": len(self._slots),
+++                "max_slots": self._max_slots if self._max_slots > 0 else "unlimited",
+++                "draining": self._draining,
+++                "drain_timeout_ms": self._drain_timeout_ms,
+++                "drain_elapsed_ms": drain_elapsed_ms,
+++                "drain_remaining_ms": max(
+++                    0, self._drain_timeout_ms - drain_elapsed_ms
+++                )
+++                if self._draining
+++                else 0,
+++                "slots": slots_info,
+++            }
+++
+++    def is_ready(self):
+++        """
+++        就绪判断: 非 drain 模式下就绪。
+++
+++        K8s readinessProbe 使用此状态:
+++            - 正常运行: ready=True -> 返回 200
+++            - drain 中:  ready=False -> 返回 503, K8s 将 Pod 从 Service Endpoints 移除
+++        """
+++        with self._lock:
+++            return not self._draining
+++
+++    def is_alive(self):
+++        """
+++        存活判断: 只要没死锁就存活。
+++
+++        K8s livenessProbe 使用此状态:
+++            始终返回 True，除非检测到异常（如 Slot 占用超时）。
+++        """
+++        return True
+++
+++
+++class SlotHealthHandler(BaseHTTPRequestHandler):
+++    """
+++    HTTP 请求处理器 - 暴露 Slot 占用状态
+++
+++    路由:
+++        GET /health            -> 综合健康状态 (200/503)
+++        GET /health/ready      -> 就绪探针 (200/503)
+++        GET /health/live       -> 存活探针 (200)
+++        GET /health/slot-status -> 详细 Slot 信息 (JSON, 始终 200)
+++    """
+++
+++    slot_manager = None
+++
+++    def log_message(self, format, *args):
+++        logger.debug("Health handler: %s", format % args)
+++
+++    def do_GET(self):
+++        path = self.path.rstrip("/")
+++        routes = {
+++            "/health": self._handle_health,
+++            "/health/ready": self._handle_ready,
+++            "/health/live": self._handle_live,
+++            "/health/slot-status": self._handle_slot_status,
+++        }
+++        handler = routes.get(path)
+++        if handler:
+++            handler()
+++        else:
+++            self._send_json(404, {"error": "not found", "path": self.path})
+++
+++    def _handle_health(self):
+++        """
+++        综合健康状态端点
+++
+++        返回:
+++            - 200: Pod 健康，可以继续服务
+++            - 503: Pod 正在 drain，不应接收新流量
+++        """
+++        mgr = self.slot_manager
+++        status = mgr.get_status()
+++        if mgr.is_ready():
+++            code = 200
+++            status["status"] = "healthy"
+++        else:
+++            code = 503
+++            status["status"] = "draining"
+++        self._send_json(code, status)
+++
+++    def _handle_ready(self):
+++        """
+++        就绪探针端点
+++
+++        K8s 配置:
+++            readinessProbe:
+++              httpGet:
+++                path: /health/ready
+++                port: 8090
+++
+++        返回:
+++            - 200: Pod 可以接收新流量
+++            - 503: Pod 正在 drain，K8s 将其从 Service Endpoints 移除
+++        """
+++        mgr = self.slot_manager
+++        if mgr.is_ready():
+++            self._send_json(200, {"ready": True})
+++        else:
+++            status = mgr.get_status()
+++            self._send_json(
+++                503,
+++                {
+++                    "ready": False,
+++                    "reason": "draining",
+++                    "slots_held": status["total_slots_held"],
+++                    "drain_remaining_ms": status["drain_remaining_ms"],
+++                },
+++            )
+++
+++    def _handle_live(self):
+++        """
+++        存活探针端点
+++
+++        K8s 配置:
+++            livenessProbe:
+++              httpGet:
+++                path: /health/live
+++                port: 8090
+++
+++        始终返回 200，除非进程异常。
+++        """
+++        mgr = self.slot_manager
+++        if mgr.is_alive():
+++            self._send_json(200, {"alive": True})
+++        else:
+++            self._send_json(503, {"alive": False})
+++
+++    def _handle_slot_status(self):
+++        """
+++        详细 Slot 状态端点
+++
+++        返回当前所有 Slot 的占用详情，包括:
+++            - 每个 Slot 的 ID、持有者、元数据、持有时长
+++            - drain 状态和进度
+++
+++        可用于调试和监控，始终返回 200。
+++        """
+++        mgr = self.slot_manager
+++        status = mgr.get_status()
+++        self._send_json(200, status)
+++
+++    def _send_json(self, code, body):
+++        payload = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
+++        self.send_response(code)
+++        self.send_header("Content-Type", "application/json; charset=utf-8")
+++        self.send_header("Content-Length", str(len(payload)))
+++        self.end_headers()
+++        self.wfile.write(payload)
+++
+++
+++class SlotHealthServer:
+++    """
+++    Slot 健康检查 HTTP 服务器
+++
+++    启动一个后台 HTTP 服务器，暴露 Slot 占用状态给 K8s 探针。
+++
+++    使用示例:
+++        manager = SlotManager(drain_timeout_ms=25000)
+++        server = SlotHealthServer(manager, port=8090)
+++        server.start()
+++
+++        # 业务代码中获取/释放 Slot
+++        slot = manager.acquire(owner="request-123")
+++        # ... 处理请求 ...
+++        manager.release(slot.slot_id)
+++
+++        # K8s 发送 SIGTERM 时自动 drain
+++        # 或手动调用: manager.start_drain()
+++    """
+++
+++    def __init__(self, slot_manager, port=DEFAULT_HEALTH_PORT, host="0.0.0.0"):
+++        self._slot_manager = slot_manager
+++        self._port = port
+++        self._host = host
+++        self._server = None
+++        self._thread = None
+++
+++    def start(self):
+++        SlotHealthHandler.slot_manager = self._slot_manager
+++        self._server = HTTPServer((self._host, self._port), SlotHealthHandler)
+++        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+++        self._thread.start()
+++        logger.info(
+++            "Slot health server started on %s:%d", self._host, self._port
+++        )
+++
+++    def stop(self):
+++        if self._server:
+++            self._server.shutdown()
+++            logger.info("Slot health server stopped")
+++
+++    @property
+++    def port(self):
+++        return self._port
+++
+++
+++class K8sLifecycleManager:
+++    """
+++    K8s 生命周期管理器
+++
+++    将 K8s SIGTERM 信号与 Slot drain 流程集成。
+++
+++    K8s Pod 终止流程:
+++        1. K8s 发送 SIGTERM
+++        2. 同时将 Pod 从 Service Endpoints 移除 (如果 readinessProbe 失败)
+++        3. 等待 terminationGracePeriodSeconds
+++        4. 发送 SIGKILL 强制终止
+++
+++    本管理器在收到 SIGTERM 时:
+++        1. 触发 SlotManager.start_drain()
+++        2. /health/ready 立即返回 503 (K8s 移除 Endpoints)
+++        3. 等待 Slot 释放或 drainTimeoutMs 超时
+++        4. 超时后仍有 Slot 未释放则强制退出
+++
+++    K8s Deployment 配置参考:
+++        spec:
+++          terminationGracePeriodSeconds: 30
+++          containers:
+++          - name: app
+++            ports:
+++            - containerPort: 8090
+++            readinessProbe:
+++              httpGet:
+++                path: /health/ready
+++                port: 8090
+++              initialDelaySeconds: 5
+++              periodSeconds: 3
+++            livenessProbe:
+++              httpGet:
+++                path: /health/live
+++                port: 8090
+++              initialDelaySeconds: 10
+++              periodSeconds: 10
+++            lifecycle:
+++              preStop:
+++                exec:
+++                  command: ["/bin/sh", "-c", "curl -s http://localhost:8090/health/ready || true; sleep 5"]
+++
+++    drainTimeoutMs 与 terminationGracePeriodSeconds 的关系:
+++        drainTimeoutMs = (terminationGracePeriodSeconds - buffer) * 1000
+++        例如: terminationGracePeriodSeconds=30, buffer=5s
+++              -> drainTimeoutMs = 25000
+++
+++        确保 drainTimeoutMs < terminationGracePeriodSeconds * 1000
+++    """
+++
+++    def __init__(self, slot_manager, health_server=None, on_shutdown=None):
+++        self._slot_manager = slot_manager
+++        self._health_server = health_server
+++        self._on_shutdown = on_shutdown
+++        self._original_sigterm = None
+++        self._shutdown_thread = None
+++
+++    def install_signal_handler(self):
+++        """
+++        注册 SIGTERM 信号处理器
+++
+++        收到 SIGTERM 后:
+++            1. 触发 drain 模式
+++            2. /health/ready 返回 503
+++            3. 后台线程等待 drain 完成
+++            4. 完成后停止健康检查服务器并调用 on_shutdown
+++        """
+++        self._original_sigterm = signal.getsignal(signal.SIGTERM)
+++        signal.signal(signal.SIGTERM, self._handle_sigterm)
+++        logger.info("K8s SIGTERM handler installed")
+++
+++    def _handle_sigterm(self, signum, frame):
+++        logger.info("SIGTERM received, starting graceful drain")
+++
+++        def _drain_and_shutdown():
+++            completed = self._slot_manager.start_drain()
+++            if not completed:
+++                logger.warning(
+++                    "Drain did not complete within %dms, forcing shutdown",
+++                    self._slot_manager.drain_timeout_ms,
+++                )
+++            if self._health_server:
+++                self._health_server.stop()
+++            if self._on_shutdown:
+++                self._on_shutdown()
+++            logger.info("Graceful shutdown complete")
+++
+++        self._shutdown_thread = threading.Thread(
+++            target=_drain_and_shutdown, daemon=True
+++        )
+++        self._shutdown_thread.start()
+++
+++    def uninstall_signal_handler(self):
+++        if self._original_sigterm is not None:
+++            signal.signal(signal.SIGTERM, self._original_sigterm)
+++            self._original_sigterm = None
+diff --git a/slot_health_endpoint.py b/slot_health_endpoint.py
+new file mode 100644
+index 0000000..431a9fd
+--- /dev/null
++++ b/slot_health_endpoint.py
+@@ -0,0 +1,484 @@
++"""
++Slot Health Endpoint - 将 Slot 占用状态暴露为 HTTP /health 端点
++
++设计目标:
++    让 Kubernetes 在 Pod 缩容时能准确判断该 Pod 是否还在持有 Slot，
++    从而避免流量损失。
++
++核心概念:
++    - Slot: 表示一个工作槽位（如连接、任务、请求处理单元）
++    - drainTimeoutMs: 排空超时时间，需小于 K8s terminationGracePeriodSeconds
++    - 当 K8s 发送 SIGTERM 时，Pod 进入 drain 模式，不再接受新 Slot，
++      等待已有 Slot 释放或超时后退出
++
++K8s 集成方式:
++    - readinessProbe  -> /health/ready  (判断是否可接收新流量)
++    - livenessProbe   -> /health/live   (判断进程是否存活)
++    - lifecycle.preStop -> 触发 drain 模式
++
++端点说明:
++    - GET /health            -> 综合健康状态
++    - GET /health/ready      -> 就绪探针: drain 中返回 503
++    - GET /health/live       -> 存活探针: 始终 200 (除非死锁)
++    - GET /health/slot-status -> 详细 Slot 占用信息 (JSON)
++"""
++
++import json
++import logging
++import signal
++import threading
++import time
++from http.server import HTTPServer, BaseHTTPRequestHandler
++from datetime import datetime, timezone
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_DRAIN_TIMEOUT_MS = 25000
++DEFAULT_HEALTH_PORT = 8090
++K8S_GRACE_PERIOD_BUFFER_MS = 5000
++
++
++class Slot:
++    """单个 Slot 的占用记录"""
++
++    __slots__ = ("slot_id", "acquired_at", "metadata", "owner")
++
++    def __init__(self, slot_id, owner=None, metadata=None):
++        self.slot_id = slot_id
++        self.owner = owner
++        self.metadata = metadata or {}
++        self.acquired_at = time.monotonic()
++
++    def hold_duration_ms(self):
++        return int((time.monotonic() - self.acquired_at) * 1000)
++
++    def to_dict(self):
++        return {
++            "slot_id": self.slot_id,
++            "owner": self.owner,
++            "metadata": self.metadata,
++            "acquired_at_utc": datetime.fromtimestamp(
++                self.acquired_at, tz=timezone.utc
++            ).isoformat(),
++            "hold_duration_ms": self.hold_duration_ms(),
++        }
++
++
++class SlotManager:
++    """
++    Slot 管理器 - 跟踪 Slot 的获取与释放
++
++    drainTimeoutMs 的设计:
++        K8s Pod 终止流程:
++        1. K8s 标记 Pod 为 Terminating
++        2. 同时执行 preStop hook (如果配置)
++        3. 等待 terminationGracePeriodSeconds 后发送 SIGKILL
++
++        drainTimeoutMs 应满足:
++            drainTimeoutMs < terminationGracePeriodSeconds * 1000 - K8S_GRACE_PERIOD_BUFFER_MS
++
++        这样确保在 K8s 强制杀死 Pod 之前，drain 逻辑有机会完成清理。
++    """
++
++    def __init__(self, max_slots=0, drain_timeout_ms=DEFAULT_DRAIN_TIMEOUT_MS):
++        self._slots = {}
++        self._lock = threading.Lock()
++        self._max_slots = max_slots
++        self._drain_timeout_ms = drain_timeout_ms
++        self._draining = False
++        self._drain_started_at = None
++        self._drain_event = threading.Event()
++        self._slot_counter = 0
++
++    @property
++    def drain_timeout_ms(self):
++        return self._drain_timeout_ms
++
++    @property
++    def draining(self):
++        return self._draining
++
++    @property
++    def drain_started_at(self):
++        return self._drain_started_at
++
++    def acquire(self, owner=None, metadata=None):
++        """
++        获取一个 Slot。drain 模式下拒绝新获取。
++
++        Returns:
++            Slot: 成功获取的 Slot 对象
++            None: drain 模式下或 Slot 已满时返回 None
++        """
++        with self._lock:
++            if self._draining:
++                logger.debug("Slot acquire rejected: draining in progress")
++                return None
++            if self._max_slots > 0 and len(self._slots) >= self._max_slots:
++                logger.debug("Slot acquire rejected: max slots reached")
++                return None
++            self._slot_counter += 1
++            slot = Slot(slot_id=self._slot_counter, owner=owner, metadata=metadata)
++            self._slots[slot.slot_id] = slot
++            logger.debug("Slot %d acquired by %s", slot.slot_id, owner)
++            return slot
++
++    def release(self, slot_id):
++        """
++        释放一个 Slot。如果 drain 模式下所有 Slot 已释放，通知等待线程。
++        """
++        with self._lock:
++            slot = self._slots.pop(slot_id, None)
++            if slot is None:
++                logger.warning("Slot %d release failed: not found", slot_id)
++                return False
++            logger.debug("Slot %d released by %s", slot.slot_id, slot.owner)
++            if self._draining and len(self._slots) == 0:
++                self._drain_event.set()
++        return True
++
++    def start_drain(self):
++        """
++        进入 drain 模式。不再接受新 Slot，等待已有 Slot 释放。
++
++        Returns:
++            bool: True 表示所有 Slot 在超时前释放; False 表示超时
++        """
++        with self._lock:
++            if self._draining:
++                logger.debug("Drain already in progress")
++                return True
++            self._draining = True
++            self._drain_started_at = time.monotonic()
++            remaining = len(self._slots)
++            if remaining == 0:
++                logger.info("Drain started: no slots held, immediate completion")
++                self._drain_event.set()
++                return True
++            logger.info(
++                "Drain started: %d slots held, timeout=%dms",
++                remaining,
++                self._drain_timeout_ms,
++            )
++
++        timeout_sec = self._drain_timeout_ms / 1000.0
++        completed = self._drain_event.wait(timeout=timeout_sec)
++
++        if completed:
++            logger.info("Drain completed: all slots released within timeout")
++        else:
++            with self._lock:
++                remaining = len(self._slots)
++            logger.warning(
++                "Drain timed out after %dms: %d slots still held",
++                self._drain_timeout_ms,
++                remaining,
++            )
++        return completed
++
++    def get_status(self):
++        """
++        获取当前 Slot 状态摘要，用于 /health 端点返回。
++        """
++        with self._lock:
++            slots_info = [s.to_dict() for s in self._slots.values()]
++            drain_elapsed_ms = 0
++            if self._draining and self._drain_started_at is not None:
++                drain_elapsed_ms = int(
++                    (time.monotonic() - self._drain_started_at) * 1000
++                )
++            return {
++                "total_slots_held": len(self._slots),
++                "max_slots": self._max_slots if self._max_slots > 0 else "unlimited",
++                "draining": self._draining,
++                "drain_timeout_ms": self._drain_timeout_ms,
++                "drain_elapsed_ms": drain_elapsed_ms,
++                "drain_remaining_ms": max(
++                    0, self._drain_timeout_ms - drain_elapsed_ms
++                )
++                if self._draining
++                else 0,
++                "slots": slots_info,
++            }
++
++    def is_ready(self):
++        """
++        就绪判断: 非 drain 模式下就绪。
++
++        K8s readinessProbe 使用此状态:
++            - 正常运行: ready=True -> 返回 200
++            - drain 中:  ready=False -> 返回 503, K8s 将 Pod 从 Service Endpoints 移除
++        """
++        with self._lock:
++            return not self._draining
++
++    def is_alive(self):
++        """
++        存活判断: 只要没死锁就存活。
++
++        K8s livenessProbe 使用此状态:
++            始终返回 True，除非检测到异常（如 Slot 占用超时）。
++        """
++        return True
++
++
++class SlotHealthHandler(BaseHTTPRequestHandler):
++    """
++    HTTP 请求处理器 - 暴露 Slot 占用状态
++
++    路由:
++        GET /health            -> 综合健康状态 (200/503)
++        GET /health/ready      -> 就绪探针 (200/503)
++        GET /health/live       -> 存活探针 (200)
++        GET /health/slot-status -> 详细 Slot 信息 (JSON, 始终 200)
++    """
++
++    slot_manager = None
++
++    def log_message(self, format, *args):
++        logger.debug("Health handler: %s", format % args)
++
++    def do_GET(self):
++        path = self.path.rstrip("/")
++        routes = {
++            "/health": self._handle_health,
++            "/health/ready": self._handle_ready,
++            "/health/live": self._handle_live,
++            "/health/slot-status": self._handle_slot_status,
++        }
++        handler = routes.get(path)
++        if handler:
++            handler()
++        else:
++            self._send_json(404, {"error": "not found", "path": self.path})
++
++    def _handle_health(self):
++        """
++        综合健康状态端点
++
++        返回:
++            - 200: Pod 健康，可以继续服务
++            - 503: Pod 正在 drain，不应接收新流量
++        """
++        mgr = self.slot_manager
++        status = mgr.get_status()
++        if mgr.is_ready():
++            code = 200
++            status["status"] = "healthy"
++        else:
++            code = 503
++            status["status"] = "draining"
++        self._send_json(code, status)
++
++    def _handle_ready(self):
++        """
++        就绪探针端点
++
++        K8s 配置:
++            readinessProbe:
++              httpGet:
++                path: /health/ready
++                port: 8090
++
++        返回:
++            - 200: Pod 可以接收新流量
++            - 503: Pod 正在 drain，K8s 将其从 Service Endpoints 移除
++        """
++        mgr = self.slot_manager
++        if mgr.is_ready():
++            self._send_json(200, {"ready": True})
++        else:
++            status = mgr.get_status()
++            self._send_json(
++                503,
++                {
++                    "ready": False,
++                    "reason": "draining",
++                    "slots_held": status["total_slots_held"],
++                    "drain_remaining_ms": status["drain_remaining_ms"],
++                },
++            )
++
++    def _handle_live(self):
++        """
++        存活探针端点
++
++        K8s 配置:
++            livenessProbe:
++              httpGet:
++                path: /health/live
++                port: 8090
++
++        始终返回 200，除非进程异常。
++        """
++        mgr = self.slot_manager
++        if mgr.is_alive():
++            self._send_json(200, {"alive": True})
++        else:
++            self._send_json(503, {"alive": False})
++
++    def _handle_slot_status(self):
++        """
++        详细 Slot 状态端点
++
++        返回当前所有 Slot 的占用详情，包括:
++            - 每个 Slot 的 ID、持有者、元数据、持有时长
++            - drain 状态和进度
++
++        可用于调试和监控，始终返回 200。
++        """
++        mgr = self.slot_manager
++        status = mgr.get_status()
++        self._send_json(200, status)
++
++    def _send_json(self, code, body):
++        payload = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
++        self.send_response(code)
++        self.send_header("Content-Type", "application/json; charset=utf-8")
++        self.send_header("Content-Length", str(len(payload)))
++        self.end_headers()
++        self.wfile.write(payload)
++
++
++class SlotHealthServer:
++    """
++    Slot 健康检查 HTTP 服务器
++
++    启动一个后台 HTTP 服务器，暴露 Slot 占用状态给 K8s 探针。
++
++    使用示例:
++        manager = SlotManager(drain_timeout_ms=25000)
++        server = SlotHealthServer(manager, port=8090)
++        server.start()
++
++        # 业务代码中获取/释放 Slot
++        slot = manager.acquire(owner="request-123")
++        # ... 处理请求 ...
++        manager.release(slot.slot_id)
++
++        # K8s 发送 SIGTERM 时自动 drain
++        # 或手动调用: manager.start_drain()
++    """
++
++    def __init__(self, slot_manager, port=DEFAULT_HEALTH_PORT, host="0.0.0.0"):
++        self._slot_manager = slot_manager
++        self._port = port
++        self._host = host
++        self._server = None
++        self._thread = None
++
++    def start(self):
++        SlotHealthHandler.slot_manager = self._slot_manager
++        self._server = HTTPServer((self._host, self._port), SlotHealthHandler)
++        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
++        self._thread.start()
++        logger.info(
++            "Slot health server started on %s:%d", self._host, self._port
++        )
++
++    def stop(self):
++        if self._server:
++            self._server.shutdown()
++            logger.info("Slot health server stopped")
++
++    @property
++    def port(self):
++        return self._port
++
++
++class K8sLifecycleManager:
++    """
++    K8s 生命周期管理器
++
++    将 K8s SIGTERM 信号与 Slot drain 流程集成。
++
++    K8s Pod 终止流程:
++        1. K8s 发送 SIGTERM
++        2. 同时将 Pod 从 Service Endpoints 移除 (如果 readinessProbe 失败)
++        3. 等待 terminationGracePeriodSeconds
++        4. 发送 SIGKILL 强制终止
++
++    本管理器在收到 SIGTERM 时:
++        1. 触发 SlotManager.start_drain()
++        2. /health/ready 立即返回 503 (K8s 移除 Endpoints)
++        3. 等待 Slot 释放或 drainTimeoutMs 超时
++        4. 超时后仍有 Slot 未释放则强制退出
++
++    K8s Deployment 配置参考:
++        spec:
++          terminationGracePeriodSeconds: 30
++          containers:
++          - name: app
++            ports:
++            - containerPort: 8090
++            readinessProbe:
++              httpGet:
++                path: /health/ready
++                port: 8090
++              initialDelaySeconds: 5
++              periodSeconds: 3
++            livenessProbe:
++              httpGet:
++                path: /health/live
++                port: 8090
++              initialDelaySeconds: 10
++              periodSeconds: 10
++            lifecycle:
++              preStop:
++                exec:
++                  command: ["/bin/sh", "-c", "curl -s http://localhost:8090/health/ready || true; sleep 5"]
++
++    drainTimeoutMs 与 terminationGracePeriodSeconds 的关系:
++        drainTimeoutMs = (terminationGracePeriodSeconds - buffer) * 1000
++        例如: terminationGracePeriodSeconds=30, buffer=5s
++              -> drainTimeoutMs = 25000
++
++        确保 drainTimeoutMs < terminationGracePeriodSeconds * 1000
++    """
++
++    def __init__(self, slot_manager, health_server=None, on_shutdown=None):
++        self._slot_manager = slot_manager
++        self._health_server = health_server
++        self._on_shutdown = on_shutdown
++        self._original_sigterm = None
++        self._shutdown_thread = None
++
++    def install_signal_handler(self):
++        """
++        注册 SIGTERM 信号处理器
++
++        收到 SIGTERM 后:
++            1. 触发 drain 模式
++            2. /health/ready 返回 503
++            3. 后台线程等待 drain 完成
++            4. 完成后停止健康检查服务器并调用 on_shutdown
++        """
++        self._original_sigterm = signal.getsignal(signal.SIGTERM)
++        signal.signal(signal.SIGTERM, self._handle_sigterm)
++        logger.info("K8s SIGTERM handler installed")
++
++    def _handle_sigterm(self, signum, frame):
++        logger.info("SIGTERM received, starting graceful drain")
++
++        def _drain_and_shutdown():
++            completed = self._slot_manager.start_drain()
++            if not completed:
++                logger.warning(
++                    "Drain did not complete within %dms, forcing shutdown",
++                    self._slot_manager.drain_timeout_ms,
++                )
++            if self._health_server:
++                self._health_server.stop()
++            if self._on_shutdown:
++                self._on_shutdown()
++            logger.info("Graceful shutdown complete")
++
++        self._shutdown_thread = threading.Thread(
++            target=_drain_and_shutdown, daemon=True
++        )
++        self._shutdown_thread.start()
++
++    def uninstall_signal_handler(self):
++        if self._original_sigterm is not None:
++            signal.signal(signal.SIGTERM, self._original_sigterm)
++            self._original_sigterm = None
