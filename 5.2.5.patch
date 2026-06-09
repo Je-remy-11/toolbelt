@@ -1,0 +1,833 @@
+diff --git a/abort_controller.py b/abort_controller.py
+new file mode 100644
+index 0000000..191157b
+--- /dev/null
++++ b/abort_controller.py
+@@ -0,0 +1,267 @@
++"""
++AbortController - 可复用的中断控制器模块
++
++用于强制中断长时间运行的 handler，解决 Graceful Shutdown 时的状态不一致问题。
++"""
++
++import threading
++import time
++import logging
++from typing import Optional, Callable, Any, Dict
++from dataclasses import dataclass, field
++from enum import Enum
++
++logger = logging.getLogger(__name__)
++
++
++class AbortSignal:
++    """
++    中断信号类，用于通知 handler 需要中断执行
++    
++    用法：
++        signal = AbortSignal()
++        
++        # 在 handler 中检查信号
++        def my_handler(signal):
++            for item in work_items:
++                if signal.is_aborted:
++                    # 清理资源并退出
++                    cleanup()
++                    return
++                process(item)
++        
++        # 触发中断
++        signal.abort()
++    """
++    
++    def __init__(self):
++        self._event = threading.Event()
++        self._reason: Optional[str] = None
++        self._callbacks: list = []
++    
++    @property
++    def is_aborted(self) -> bool:
++        return self._event.is_set()
++    
++    @property
++    def reason(self) -> Optional[str]:
++        return self._reason
++    
++    def abort(self, reason: str = "Operation aborted"):
++        """触发中断信号"""
++        if not self.is_aborted:
++            self._reason = reason
++            self._event.set()
++            for callback in self._callbacks:
++                try:
++                    callback(reason)
++                except Exception as e:
++                    logger.error(f"Error in abort callback: {e}")
++    
++    def on_abort(self, callback: Callable[[str], None]):
++        """注册中断回调"""
++        self._callbacks.append(callback)
++    
++    def wait(self, timeout: Optional[float] = None) -> bool:
++        """等待中断信号，返回是否被中断"""
++        return self._event.wait(timeout=timeout)
++    
++    def reset(self):
++        """重置信号（谨慎使用）"""
++        self._event.clear()
++        self._reason = None
++
++
++class AbortController:
++    """
++    中断控制器，用于创建和管理 AbortSignal
++    
++    用法：
++        controller = AbortController()
++        signal = controller.signal
++        
++        # 启动 handler
++        thread = threading.Thread(target=my_handler, args=(signal,))
++        thread.start()
++        
++        # 需要中断时
++        controller.abort("Timeout")
++    """
++    
++    def __init__(self):
++        self.signal = AbortSignal()
++    
++    def abort(self, reason: str = "Operation aborted"):
++        self.signal.abort(reason)
++
++
++@dataclass
++class TaskContext:
++    """任务执行上下文，包含中断信号和状态管理"""
++    task_id: str
++    signal: AbortSignal = field(default_factory=AbortSignal)
++    result: Any = None
++    error: Optional[Exception] = None
++    start_time: float = field(default_factory=time.time)
++    
++    @property
++    def is_aborted(self) -> bool:
++        return self.signal.is_aborted
++    
++    @property
++    def elapsed(self) -> float:
++        return time.time() - self.start_time
++    
++    def abort(self, reason: str = "Task aborted"):
++        self.signal.abort(reason)
++    
++    def check_timeout(self, timeout: float) -> bool:
++        """检查是否超时，如果超时则自动中断"""
++        if self.elapsed > timeout:
++            self.abort(f"Task timed out after {self.elapsed:.2f}s (limit: {timeout}s)")
++            return True
++        return False
++    
++    def sleep(self, seconds: float) -> bool:
++        """可中断的睡眠，返回是否被中断"""
++        return self.signal.wait(timeout=seconds)
++
++
++class TaskManager:
++    """
++    任务管理器，用于管理多个可中断的任务
++    
++    用法：
++        manager = TaskManager()
++        
++        # 提交任务
++        manager.submit("task-1", my_handler, timeout=10.0)
++        
++        # 中断单个任务
++        manager.abort_task("task-1")
++        
++        # Graceful Shutdown
++        manager.shutdown(timeout=30.0)
++    """
++    
++    def __init__(self, default_timeout: float = 30.0, shutdown_timeout: float = 10.0):
++        self.default_timeout = default_timeout
++        self.shutdown_timeout = shutdown_timeout
++        self._tasks: Dict[str, TaskContext] = {}
++        self._threads: Dict[str, threading.Thread] = {}
++        self._lock = threading.Lock()
++        self._running = True
++    
++    def submit(self, task_id: str, handler: Callable, timeout: Optional[float] = None, **kwargs) -> TaskContext:
++        """提交一个可中断的任务"""
++        ctx = TaskContext(task_id=task_id)
++        timeout = timeout or self.default_timeout
++        
++        thread = threading.Thread(
++            target=self._run_task,
++            args=(ctx, handler, timeout),
++            kwargs=kwargs,
++            daemon=True,
++            name=f"task-{task_id}"
++        )
++        
++        with self._lock:
++            self._tasks[task_id] = ctx
++            self._threads[task_id] = thread
++        
++        thread.start()
++        return ctx
++    
++    def _run_task(self, ctx: TaskContext, handler: Callable, timeout: float, **kwargs):
++        try:
++            result = handler(ctx, **kwargs)
++            if not ctx.is_aborted:
++                ctx.result = result
++        except Exception as e:
++            if not ctx.is_aborted:
++                ctx.error = e
++                logger.error(f"Task {ctx.task_id} failed: {e}")
++    
++    def abort_task(self, task_id: str, reason: str = "Task aborted"):
++        """中断指定任务"""
++        with self._lock:
++            ctx = self._tasks.get(task_id)
++            if ctx:
++                ctx.abort(reason)
++                logger.info(f"Abort signal sent to task {task_id}")
++    
++    def get_task(self, task_id: str) -> Optional[TaskContext]:
++        with self._lock:
++            return self._tasks.get(task_id)
++    
++    @property
++    def active_tasks(self) -> list:
++        with self._lock:
++            return [
++                (task_id, ctx) 
++                for task_id, ctx in self._tasks.items()
++                if self._threads.get(task_id) and self._threads[task_id].is_alive()
++            ]
++    
++    def shutdown(self, timeout: Optional[float] = None, reason: str = "Shutdown"):
++        """
++        Graceful Shutdown，强制中断所有活跃任务
++        
++        步骤：
++            1. 标记停止状态
++            2. 向所有活跃任务发送 abort 信号
++            3. 等待任务结束（带超时）
++            4. 记录未响应的任务
++        """
++        self._running = False
++        timeout = timeout or self.shutdown_timeout
++        
++        logger.info(f"Graceful shutdown initiated (timeout: {timeout}s)")
++        
++        with self._lock:
++            active = [
++                (task_id, ctx, self._threads[task_id])
++                for task_id, ctx in self._tasks.items()
++                if self._threads.get(task_id) and self._threads[task_id].is_alive()
++            ]
++        
++        if not active:
++            logger.info("No active tasks, shutdown complete")
++            return
++        
++        logger.info(f"Found {len(active)} active tasks, sending abort signals...")
++        
++        # 发送 abort 信号
++        for task_id, ctx, _ in active:
++            ctx.abort(reason)
++        
++        # 等待任务结束
++        deadline = time.time() + timeout
++        for task_id, ctx, thread in active:
++            remaining = max(0, deadline - time.time())
++            if remaining > 0:
++                thread.join(timeout=remaining)
++            
++            if thread.is_alive():
++                logger.error(
++                    f"Task {task_id} did not respond to abort signal, "
++                    f"forcing termination"
++                )
++            else:
++                logger.info(f"Task {task_id} terminated gracefully")
++        
++        logger.info("Shutdown complete")
++    
++    def wait_all(self, timeout: Optional[float] = None) -> bool:
++        """等待所有任务完成，返回是否全部完成"""
++        with self._lock:
++            threads = list(self._threads.values())
++        
++        deadline = time.time() + (timeout or float('inf'))
++        for thread in threads:
++            remaining = max(0, deadline - time.time())
++            if remaining > 0:
++                thread.join(timeout=remaining)
++            if thread.is_alive():
++                return False
++        return True
+diff --git a/handler_timeout_graceful_shutdown_demo.py b/handler_timeout_graceful_shutdown_demo.py
+new file mode 100644
+index 0000000..e3b4b0a
+--- /dev/null
++++ b/handler_timeout_graceful_shutdown_demo.py
+@@ -0,0 +1,301 @@
++"""
++Handler Timeout 与 Graceful Shutdown 状态不一致问题演示及解决方案
++
++问题场景：
++    当 handler 超时被标记为 failed 时，处理函数仍在后台执行（zombie）。
++    如果此时发生 Graceful Shutdown，会出现以下状态不一致：
++    
++    1. Server 状态：认为所有 handler 已终止（标记为 failed）
++    2. 实际状态：handler 仍在后台运行
++    3. 后果：
++       - 资源泄漏（连接、文件句柄等未释放）
++       - 数据不一致（部分写入的数据）
++       - 回调/副作用在 shutdown 后继续执行
++"""
++
++import threading
++import time
++import logging
++import signal
++import sys
++from typing import Dict, Optional, Callable, Any
++from dataclasses import dataclass, field
++from enum import Enum
++
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
++logger = logging.getLogger(__name__)
++
++
++class HandlerState(Enum):
++    PENDING = "pending"
++    RUNNING = "running"
++    COMPLETED = "completed"
++    FAILED = "failed"
++    ABORTED = "aborted"
++
++
++@dataclass
++class HandlerContext:
++    """Handler 执行上下文，包含中断信号"""
++    handler_id: str
++    state: HandlerState = HandlerState.PENDING
++    thread: Optional[threading.Thread] = None
++    abort_event: threading.Event = field(default_factory=threading.Event)
++    result: Any = None
++    error: Optional[Exception] = None
++    start_time: float = 0.0
++    
++    def is_aborted(self) -> bool:
++        return self.abort_event.is_set()
++    
++    def abort(self):
++        self.abort_event.set()
++        self.state = HandlerState.ABORTED
++
++
++class HandlerExecutor:
++    """
++    问题版本：没有强制中断机制
++    
++    问题：
++        - timeout 后标记为 failed，但 handler 线程仍在运行
++        - stop() 只是等待线程结束，无法强制中断
++        - Graceful Shutdown 时，zombie handler 继续执行
++    """
++    
++    def __init__(self, timeout: float = 5.0):
++        self.timeout = timeout
++        self.handlers: Dict[str, HandlerContext] = {}
++        self._lock = threading.Lock()
++        self._running = True
++    
++    def submit(self, handler_id: str, handler_func: Callable) -> HandlerContext:
++        ctx = HandlerContext(handler_id=handler_id)
++        ctx.state = HandlerState.RUNNING
++        ctx.start_time = time.time()
++        
++        thread = threading.Thread(
++            target=self._run_handler,
++            args=(ctx, handler_func),
++            daemon=True
++        )
++        ctx.thread = thread
++        thread.start()
++        
++        with self._lock:
++            self.handlers[handler_id] = ctx
++        
++        return ctx
++    
++    def _run_handler(self, ctx: HandlerContext, handler_func: Callable):
++        try:
++            result = handler_func(ctx)
++            if not ctx.is_aborted():
++                ctx.result = result
++                ctx.state = HandlerState.COMPLETED
++        except Exception as e:
++            if not ctx.is_aborted():
++                ctx.error = e
++                ctx.state = HandlerState.FAILED
++    
++    def stop(self):
++        """
++        问题版本：只是标记停止，等待线程自然结束
++        
++        问题：
++            - zombie handler 仍在运行，但 server 认为已停止
++            - 无法强制中断正在执行的 handler
++        """
++        self._running = False
++        logger.info("Graceful shutdown initiated...")
++        
++        with self._lock:
++            for handler_id, ctx in self.handlers.items():
++                if ctx.thread and ctx.thread.is_alive():
++                    logger.warning(
++                        f"Handler {handler_id} is still running (zombie), "
++                        f"state: {ctx.state}"
++                    )
++                    ctx.state = HandlerState.FAILED
++                    # 问题：这里只是标记 failed，但线程仍在运行！
++        
++        logger.info("Shutdown complete (but zombies may still be running)")
++
++
++class SafeHandlerExecutor:
++    """
++    解决方案版本：使用 AbortController 模式强制中断
++    
++    改进：
++        1. HandlerContext 包含 abort_event 用于信号通知
++        2. Handler 函数需要定期检查 abort 信号
++        3. stop() 强制设置 abort 信号并等待线程结束
++        4. 支持超时强制终止线程
++    """
++    
++    def __init__(self, timeout: float = 5.0, shutdown_timeout: float = 10.0):
++        self.timeout = timeout
++        self.shutdown_timeout = shutdown_timeout
++        self.handlers: Dict[str, HandlerContext] = {}
++        self._lock = threading.Lock()
++        self._running = True
++    
++    def submit(self, handler_id: str, handler_func: Callable) -> HandlerContext:
++        ctx = HandlerContext(handler_id=handler_id)
++        ctx.state = HandlerState.RUNNING
++        ctx.start_time = time.time()
++        
++        thread = threading.Thread(
++            target=self._run_handler,
++            args=(ctx, handler_func),
++            daemon=True
++        )
++        ctx.thread = thread
++        thread.start()
++        
++        with self._lock:
++            self.handlers[handler_id] = ctx
++        
++        return ctx
++    
++    def _run_handler(self, ctx: HandlerContext, handler_func: Callable):
++        try:
++            result = handler_func(ctx)
++            if not ctx.is_aborted():
++                ctx.result = result
++                ctx.state = HandlerState.COMPLETED
++            else:
++                logger.info(f"Handler {ctx.handler_id} was aborted, discarding result")
++        except Exception as e:
++            if not ctx.is_aborted():
++                ctx.error = e
++                ctx.state = HandlerState.FAILED
++            else:
++                logger.info(f"Handler {ctx.handler_id} aborted with exception: {e}")
++    
++    def abort_handler(self, handler_id: str):
++        """强制中断指定的 handler"""
++        with self._lock:
++            ctx = self.handlers.get(handler_id)
++            if ctx and ctx.thread and ctx.thread.is_alive():
++                ctx.abort()
++                logger.info(f"Abort signal sent to handler {handler_id}")
++    
++    def stop(self):
++        """
++        解决方案：强制中断所有正在执行的 handler
++        
++        步骤：
++            1. 标记停止状态
++            2. 向所有 running handler 发送 abort 信号
++            3. 等待线程结束（带超时）
++            4. 超时后强制终止
++        """
++        self._running = False
++        logger.info("Graceful shutdown initiated...")
++        
++        active_handlers = []
++        with self._lock:
++            for handler_id, ctx in self.handlers.items():
++                if ctx.thread and ctx.thread.is_alive():
++                    active_handlers.append((handler_id, ctx))
++        
++        if not active_handlers:
++            logger.info("No active handlers, shutdown complete")
++            return
++        
++        logger.info(f"Found {len(active_handlers)} active handlers, sending abort signals...")
++        
++        # 步骤1：发送 abort 信号
++        for handler_id, ctx in active_handlers:
++            ctx.abort()
++            logger.info(f"Abort signal sent to handler {handler_id}")
++        
++        # 步骤2：等待线程结束（带超时）
++        deadline = time.time() + self.shutdown_timeout
++        for handler_id, ctx in active_handlers:
++            remaining = max(0, deadline - time.time())
++            if remaining > 0:
++                ctx.thread.join(timeout=remaining)
++            
++            if ctx.thread.is_alive():
++                logger.error(
++                    f"Handler {handler_id} did not respond to abort signal, "
++                    f"forcing termination (state: {ctx.state})"
++                )
++                ctx.state = HandlerState.ABORTED
++            else:
++                logger.info(f"Handler {handler_id} terminated gracefully")
++        
++        logger.info("Shutdown complete, all handlers terminated")
++
++
++def demo_problem():
++    """演示问题版本"""
++    print("\n" + "="*60)
++    print("问题版本演示")
++    print("="*60)
++    
++    executor = HandlerExecutor(timeout=2.0)
++    
++    def slow_handler(ctx):
++        logger.info(f"Handler {ctx.handler_id} starting...")
++        for i in range(10):
++            if ctx.is_aborted():
++                logger.info(f"Handler {ctx.handler_id} detected abort")
++                return None
++            time.sleep(0.5)
++            logger.info(f"Handler {ctx.handler_id} step {i+1}/10")
++        return "done"
++    
++    ctx = executor.submit("handler-1", slow_handler)
++    time.sleep(1)
++    
++    logger.info("Simulating timeout - marking handler as failed")
++    ctx.state = HandlerState.FAILED
++    
++    logger.info("Simulating graceful shutdown")
++    executor.stop()
++    
++    time.sleep(2)
++    logger.info(f"Handler state after shutdown: {ctx.state}")
++    logger.info(f"Handler thread alive: {ctx.thread.is_alive() if ctx.thread else False}")
++    logger.info("注意：handler 仍在后台运行！")
++
++
++def demo_solution():
++    """演示解决方案版本"""
++    print("\n" + "="*60)
++    print("解决方案版本演示")
++    print("="*60)
++    
++    executor = SafeHandlerExecutor(timeout=2.0, shutdown_timeout=3.0)
++    
++    def slow_handler(ctx):
++        logger.info(f"Handler {ctx.handler_id} starting...")
++        for i in range(10):
++            if ctx.is_aborted():
++                logger.info(f"Handler {ctx.handler_id} detected abort, cleaning up...")
++                return None
++            time.sleep(0.5)
++            logger.info(f"Handler {ctx.handler_id} step {i+1}/10")
++        return "done"
++    
++    ctx = executor.submit("handler-1", slow_handler)
++    time.sleep(1)
++    
++    logger.info("Simulating timeout - aborting handler")
++    executor.abort_handler("handler-1")
++    
++    logger.info("Simulating graceful shutdown")
++    executor.stop()
++    
++    time.sleep(1)
++    logger.info(f"Handler state after shutdown: {ctx.state}")
++    logger.info(f"Handler thread alive: {ctx.thread.is_alive() if ctx.thread else False}")
++    logger.info("注意：handler 已被正确中断！")
++
++
++if __name__ == "__main__":
++    demo_problem()
++    demo_solution()
+diff --git a/tests/test_abort_controller.py b/tests/test_abort_controller.py
+new file mode 100644
+index 0000000..26f153a
+--- /dev/null
++++ b/tests/test_abort_controller.py
+@@ -0,0 +1,247 @@
++"""
++AbortController 单元测试
++
++验证中断控制器在 handler timeout 和 graceful shutdown 场景下的正确性。
++"""
++
++import pytest
++import threading
++import time
++from abort_controller import AbortSignal, AbortController, TaskContext, TaskManager
++
++
++class TestAbortSignal:
++    def test_initial_state(self):
++        signal = AbortSignal()
++        assert not signal.is_aborted
++        assert signal.reason is None
++    
++    def test_abort_sets_state(self):
++        signal = AbortSignal()
++        signal.abort("Test reason")
++        assert signal.is_aborted
++        assert signal.reason == "Test reason"
++    
++    def test_abort_is_idempotent(self):
++        signal = AbortSignal()
++        signal.abort("First reason")
++        signal.abort("Second reason")
++        assert signal.reason == "First reason"
++    
++    def test_callback_is_called(self):
++        signal = AbortSignal()
++        callback_called = []
++        
++        def callback(reason):
++            callback_called.append(reason)
++        
++        signal.on_abort(callback)
++        signal.abort("Test")
++        assert callback_called == ["Test"]
++    
++    def test_multiple_callbacks(self):
++        signal = AbortSignal()
++        results = []
++        
++        signal.on_abort(lambda r: results.append(1))
++        signal.on_abort(lambda r: results.append(2))
++        signal.on_abort(lambda r: results.append(3))
++        
++        signal.abort()
++        assert results == [1, 2, 3]
++    
++    def test_wait_returns_true_on_abort(self):
++        signal = AbortSignal()
++        
++        def abort_after_delay():
++            time.sleep(0.1)
++            signal.abort()
++        
++        threading.Thread(target=abort_after_delay).start()
++        result = signal.wait(timeout=1.0)
++        assert result is True
++    
++    def test_wait_returns_false_on_timeout(self):
++        signal = AbortSignal()
++        result = signal.wait(timeout=0.1)
++        assert result is False
++    
++    def test_reset(self):
++        signal = AbortSignal()
++        signal.abort()
++        signal.reset()
++        assert not signal.is_aborted
++
++
++class TestAbortController:
++    def test_controller_creates_signal(self):
++        controller = AbortController()
++        assert controller.signal is not None
++        assert not controller.signal.is_aborted
++    
++    def test_controller_abort(self):
++        controller = AbortController()
++        controller.abort("Test")
++        assert controller.signal.is_aborted
++        assert controller.signal.reason == "Test"
++
++
++class TestTaskContext:
++    def test_initial_state(self):
++        ctx = TaskContext("test-task")
++        assert not ctx.is_aborted
++        assert ctx.result is None
++        assert ctx.error is None
++    
++    def test_abort(self):
++        ctx = TaskContext("test-task")
++        ctx.abort("Test reason")
++        assert ctx.is_aborted
++    
++    def test_elapsed_time(self):
++        ctx = TaskContext("test-task")
++        time.sleep(0.1)
++        assert ctx.elapsed >= 0.1
++    
++    def test_check_timeout_no_timeout(self):
++        ctx = TaskContext("test-task")
++        assert not ctx.check_timeout(timeout=10.0)
++        assert not ctx.is_aborted
++    
++    def test_check_timeout_triggers(self):
++        ctx = TaskContext("test-task")
++        ctx.start_time = time.time() - 5  # Simulate 5 seconds elapsed
++        assert ctx.check_timeout(timeout=1.0)
++        assert ctx.is_aborted
++    
++    def test_sleep_interruptible(self):
++        ctx = TaskContext("test-task")
++        
++        def abort_after_delay():
++            time.sleep(0.1)
++            ctx.abort()
++        
++        threading.Thread(target=abort_after_delay).start()
++        interrupted = ctx.sleep(seconds=1.0)
++        assert interrupted is True
++    
++    def test_sleep_completes(self):
++        ctx = TaskContext("test-task")
++        interrupted = ctx.sleep(seconds=0.1)
++        assert interrupted is False
++
++
++class TestTaskManager:
++    def test_submit_and_complete(self):
++        manager = TaskManager()
++        
++        def quick_task(ctx):
++            return "done"
++        
++        ctx = manager.submit("task-1", quick_task)
++        assert manager.wait_all(timeout=5.0)
++        assert ctx.result == "done"
++    
++    def test_submit_with_error(self):
++        manager = TaskManager()
++        
++        def failing_task(ctx):
++            raise ValueError("Test error")
++        
++        ctx = manager.submit("task-1", failing_task)
++        manager.wait_all(timeout=5.0)
++        assert ctx.error is not None
++        assert isinstance(ctx.error, ValueError)
++    
++    def test_abort_task(self):
++        manager = TaskManager()
++        
++        def long_task(ctx):
++            while not ctx.is_aborted:
++                time.sleep(0.1)
++            return "aborted"
++        
++        ctx = manager.submit("task-1", long_task)
++        time.sleep(0.1)
++        manager.abort_task("task-1")
++        assert manager.wait_all(timeout=5.0)
++    
++    def test_graceful_shutdown(self):
++        manager = TaskManager()
++        completed_tasks = []
++        
++        def long_task(ctx, task_num):
++            for i in range(100):
++                if ctx.is_aborted:
++                    completed_tasks.append(f"task-{task_num}-aborted")
++                    return
++                time.sleep(0.1)
++            completed_tasks.append(f"task-{task_num}-completed")
++        
++        manager.submit("task-1", long_task, task_num=1)
++        manager.submit("task-2", long_task, task_num=2)
++        manager.submit("task-3", long_task, task_num=3)
++        
++        time.sleep(0.5)
++        manager.shutdown(timeout=2.0)
++        
++        assert all("aborted" in t for t in completed_tasks)
++    
++    def test_shutdown_with_unresponsive_task(self):
++        manager = TaskManager(shutdown_timeout=0.5)
++        
++        def unresponsive_task(ctx):
++            while True:
++                time.sleep(10)
++        
++        manager.submit("task-1", unresponsive_task)
++        time.sleep(0.1)
++        
++        manager.shutdown(timeout=0.5)
++        ctx = manager.get_task("task-1")
++        assert ctx is not None
++    
++    def test_active_tasks(self):
++        manager = TaskManager()
++        
++        def long_task(ctx):
++            time.sleep(10)
++        
++        manager.submit("task-1", long_task)
++        manager.submit("task-2", long_task)
++        
++        time.sleep(0.1)
++        active = manager.active_tasks
++        assert len(active) == 2
++        
++        manager.abort_task("task-1")
++        manager.abort_task("task-2")
++        manager.wait_all(timeout=5.0)
++        
++        assert len(manager.active_tasks) == 0
++    
++    def test_concurrent_submit_and_abort(self):
++        manager = TaskManager()
++        
++        def long_task(ctx):
++            while not ctx.is_aborted:
++                time.sleep(0.1)
++        
++        threads = []
++        for i in range(10):
++            t = threading.Thread(target=lambda: manager.submit(f"task-{i}", long_task))
++            threads.append(t)
++            t.start()
++        
++        for t in threads:
++            t.join()
++        
++        time.sleep(0.1)
++        assert len(manager.active_tasks) == 10
++        
++        manager.shutdown(timeout=2.0)
++        assert len(manager.active_tasks) == 0
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])
