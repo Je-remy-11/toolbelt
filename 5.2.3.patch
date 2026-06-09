@@ -1,0 +1,11 @@
+const inFlightPromises = Array.from(inFlight);
+const activeHandlerPromises = Array.from(activeHandlers.values()).map((h) => h.promise);
+const allPromises = [...inFlightPromises, ...activeHandlerPromises];
+
+if (allPromises.length > 0) {
+  logger.info(
+    `cron: draining ${inFlightPromises.length} in-flight run(s) and ${activeHandlerPromises.length} active handler(s) [worker=${workerId}]`
+  );
+  const drained = Promise.allSettled(allPromises);
+  // ... drain with timeout
+}
