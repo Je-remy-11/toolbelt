@@ -1,0 +1,722 @@
+diff --git a/src/cron/adapters/inMemory.ts b/src/cron/adapters/inMemory.ts
+new file mode 100644
+index 0000000..4c1b681
+--- /dev/null
++++ b/src/cron/adapters/inMemory.ts
+@@ -0,0 +1,120 @@
++import type { ClusterMembershipPort, CriticalSectionPort, SlotLeasePort } from '../core/ports';
++import type { JobName, SlotId, SlotLease, WorkerId } from '../core/types';
++
++export class InMemoryCronCoordinator implements ClusterMembershipPort, SlotLeasePort, CriticalSectionPort {
++  private readonly memberships = new Map<JobName, Map<WorkerId, number>>();
++  private readonly leases = new Map<JobName, Map<SlotId, SlotLease>>();
++  private readonly activeLocks = new Set<string>();
++
++  async heartbeat(params: {
++    readonly jobName: JobName;
++    readonly workerId: WorkerId;
++    readonly ttlMs: number;
++    readonly now: number;
++  }): Promise<void> {
++    const members = this.memberships.get(params.jobName) ?? new Map<WorkerId, number>();
++    members.set(params.workerId, params.now + params.ttlMs);
++    this.memberships.set(params.jobName, members);
++  }
++
++  async listActiveWorkers(jobName: JobName, now: number): Promise<readonly WorkerId[]> {
++    const members = this.memberships.get(jobName) ?? new Map<WorkerId, number>();
++    const activeWorkers: WorkerId[] = [];
++
++    for (const [workerId, expiresAt] of members.entries()) {
++      if (expiresAt > now) {
++        activeWorkers.push(workerId);
++      }
++    }
++
++    return activeWorkers.sort((left, right) => left.localeCompare(right));
++  }
++
++  async listLeases(jobName: JobName, now: number): Promise<readonly SlotLease[]> {
++    const leaseMap = this.leases.get(jobName) ?? new Map<SlotId, SlotLease>();
++    const activeLeases: SlotLease[] = [];
++
++    for (const lease of leaseMap.values()) {
++      if (lease.leaseUntil > now) {
++        activeLeases.push(lease);
++      }
++    }
++
++    return activeLeases.sort((left, right) => left.slotId - right.slotId);
++  }
++
++  async claimLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++    readonly leaseUntil: number;
++    readonly now: number;
++  }): Promise<boolean> {
++    const leaseMap = this.leases.get(params.jobName) ?? new Map<SlotId, SlotLease>();
++    const existingLease = leaseMap.get(params.slotId);
++
++    if (existingLease && existingLease.leaseUntil > params.now && existingLease.ownerId !== params.ownerId) {
++      return false;
++    }
++
++    leaseMap.set(params.slotId, {
++      jobName: params.jobName,
++      slotId: params.slotId,
++      ownerId: params.ownerId,
++      leaseUntil: params.leaseUntil,
++    });
++    this.leases.set(params.jobName, leaseMap);
++    return true;
++  }
++
++  async renewLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++    readonly leaseUntil: number;
++    readonly now: number;
++  }): Promise<boolean> {
++    const leaseMap = this.leases.get(params.jobName) ?? new Map<SlotId, SlotLease>();
++    const existingLease = leaseMap.get(params.slotId);
++
++    if (!existingLease || existingLease.ownerId !== params.ownerId || existingLease.leaseUntil <= params.now) {
++      return false;
++    }
++
++    leaseMap.set(params.slotId, {
++      jobName: params.jobName,
++      slotId: params.slotId,
++      ownerId: params.ownerId,
++      leaseUntil: params.leaseUntil,
++    });
++    this.leases.set(params.jobName, leaseMap);
++    return true;
++  }
++
++  async releaseLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++  }): Promise<void> {
++    const leaseMap = this.leases.get(params.jobName) ?? new Map<SlotId, SlotLease>();
++    const existingLease = leaseMap.get(params.slotId);
++
++    if (existingLease && existingLease.ownerId === params.ownerId) {
++      leaseMap.delete(params.slotId);
++      this.leases.set(params.jobName, leaseMap);
++    }
++  }
++
++  async runExclusive<T>(key: string, _ttlMs: number, task: () => Promise<T>): Promise<T> {
++    if (this.activeLocks.has(key)) {
++      throw new Error(`Lock already held: ${key}`);
++    }
++
++    this.activeLocks.add(key);
++    try {
++      return await task();
++    } finally {
++      this.activeLocks.delete(key);
++    }
++  }
++}
+diff --git a/src/cron/adapters/ioredis.ts b/src/cron/adapters/ioredis.ts
+new file mode 100644
+index 0000000..f296f0e
+--- /dev/null
++++ b/src/cron/adapters/ioredis.ts
+@@ -0,0 +1,209 @@
++import type { ClusterMembershipPort, CriticalSectionPort, SlotLeasePort } from '../core/ports';
++import type { JobName, SlotId, SlotLease, WorkerId } from '../core/types';
++
++export interface RedisLike {
++  zadd(key: string, score: number, member: string): Promise<number>;
++  zrangebyscore(key: string, min: number | string, max: number | string): Promise<string[]>;
++  hgetall(key: string): Promise<Record<string, string>>;
++  set(
++    key: string,
++    value: string,
++    mode: 'PX',
++    durationMs: number,
++    condition: 'NX',
++  ): Promise<'OK' | null>;
++  eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<number>;
++}
++
++const CLAIM_OR_STEAL_SCRIPT = `
++local payload = ARGV[1]
++local slotField = ARGV[2]
++local now = tonumber(ARGV[3])
++local current = redis.call('HGET', KEYS[1], slotField)
++if not current then
++  redis.call('HSET', KEYS[1], slotField, payload)
++  return 1
++end
++local decoded = cjson.decode(current)
++if decoded.ownerId == cjson.decode(payload).ownerId then
++  redis.call('HSET', KEYS[1], slotField, payload)
++  return 1
++end
++if tonumber(decoded.leaseUntil) <= now then
++  redis.call('HSET', KEYS[1], slotField, payload)
++  return 1
++end
++return 0
++`;
++
++const RENEW_IF_OWNER_SCRIPT = `
++local payload = ARGV[1]
++local slotField = ARGV[2]
++local ownerId = ARGV[3]
++local now = tonumber(ARGV[4])
++local current = redis.call('HGET', KEYS[1], slotField)
++if not current then
++  return 0
++end
++local decoded = cjson.decode(current)
++if decoded.ownerId ~= ownerId then
++  return 0
++end
++if tonumber(decoded.leaseUntil) <= now then
++  return 0
++end
++redis.call('HSET', KEYS[1], slotField, payload)
++return 1
++`;
++
++const RELEASE_IF_OWNER_SCRIPT = `
++local slotField = ARGV[1]
++local ownerId = ARGV[2]
++local current = redis.call('HGET', KEYS[1], slotField)
++if not current then
++  return 0
++end
++local decoded = cjson.decode(current)
++if decoded.ownerId ~= ownerId then
++  return 0
++end
++redis.call('HDEL', KEYS[1], slotField)
++return 1
++`;
++
++const RELEASE_LOCK_SCRIPT = `
++local expectedToken = ARGV[1]
++local currentToken = redis.call('GET', KEYS[1])
++if currentToken == expectedToken then
++  return redis.call('DEL', KEYS[1])
++end
++return 0
++`;
++
++function serializeLease(lease: SlotLease): string {
++  return JSON.stringify(lease);
++}
++
++function deserializeLease(payload: string): SlotLease {
++  return JSON.parse(payload) as SlotLease;
++}
++
++export class IoredisCronCoordinator implements ClusterMembershipPort, SlotLeasePort, CriticalSectionPort {
++  constructor(private readonly redis: RedisLike) {}
++
++  async heartbeat(params: {
++    readonly jobName: JobName;
++    readonly workerId: WorkerId;
++    readonly ttlMs: number;
++    readonly now: number;
++  }): Promise<void> {
++    await this.redis.zadd(this.membersKey(params.jobName), params.now + params.ttlMs, params.workerId);
++  }
++
++  async listActiveWorkers(jobName: JobName, now: number): Promise<readonly WorkerId[]> {
++    return this.redis.zrangebyscore(this.membersKey(jobName), now, '+inf');
++  }
++
++  async listLeases(jobName: JobName, now: number): Promise<readonly SlotLease[]> {
++    const entries = await this.redis.hgetall(this.leasesKey(jobName));
++
++    return Object.values(entries)
++      .map((payload) => deserializeLease(payload))
++      .filter((lease) => lease.leaseUntil > now)
++      .sort((left, right) => left.slotId - right.slotId);
++  }
++
++  async claimLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++    readonly leaseUntil: number;
++    readonly now: number;
++  }): Promise<boolean> {
++    const lease = serializeLease({
++      jobName: params.jobName,
++      slotId: params.slotId,
++      ownerId: params.ownerId,
++      leaseUntil: params.leaseUntil,
++    });
++
++    const result = await this.redis.eval(
++      CLAIM_OR_STEAL_SCRIPT,
++      1,
++      this.leasesKey(params.jobName),
++      lease,
++      String(params.slotId),
++      params.now,
++    );
++
++    return result === 1;
++  }
++
++  async renewLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++    readonly leaseUntil: number;
++    readonly now: number;
++  }): Promise<boolean> {
++    const lease = serializeLease({
++      jobName: params.jobName,
++      slotId: params.slotId,
++      ownerId: params.ownerId,
++      leaseUntil: params.leaseUntil,
++    });
++
++    const result = await this.redis.eval(
++      RENEW_IF_OWNER_SCRIPT,
++      1,
++      this.leasesKey(params.jobName),
++      lease,
++      String(params.slotId),
++      params.ownerId,
++      params.now,
++    );
++
++    return result === 1;
++  }
++
++  async releaseLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++  }): Promise<void> {
++    await this.redis.eval(
++      RELEASE_IF_OWNER_SCRIPT,
++      1,
++      this.leasesKey(params.jobName),
++      String(params.slotId),
++      params.ownerId,
++    );
++  }
++
++  async runExclusive<T>(key: string, ttlMs: number, task: () => Promise<T>): Promise<T> {
++    const token = `${Date.now()}:${Math.random()}`;
++    const acquired = await this.redis.set(this.lockKey(key), token, 'PX', ttlMs, 'NX');
++
++    if (acquired !== 'OK') {
++      throw new Error(`Failed to acquire lock: ${key}`);
++    }
++
++    try {
++      return await task();
++    } finally {
++      await this.redis.eval(RELEASE_LOCK_SCRIPT, 1, this.lockKey(key), token);
++    }
++  }
++
++  private membersKey(jobName: JobName): string {
++    return `cron:${jobName}:members`;
++  }
++
++  private leasesKey(jobName: JobName): string {
++    return `cron:${jobName}:leases`;
++  }
++
++  private lockKey(key: string): string {
++    return `cron:lock:${key}`;
++  }
++}
+diff --git a/src/cron/core/cronJobFactory.ts b/src/cron/core/cronJobFactory.ts
+new file mode 100644
+index 0000000..1d6c11b
+--- /dev/null
++++ b/src/cron/core/cronJobFactory.ts
+@@ -0,0 +1,112 @@
++import type { ClockPort, ClusterMembershipPort, CriticalSectionPort, SlotAllocatorPort, SlotLeasePort } from './ports';
++import type { JobName, SlotId, TickPlanResult, WorkerId } from './types';
++
++export interface CronJobFactoryDeps {
++  readonly clock: ClockPort;
++  readonly membership: ClusterMembershipPort;
++  readonly leases: SlotLeasePort;
++  readonly criticalSection: CriticalSectionPort;
++  readonly slotAllocator: SlotAllocatorPort;
++}
++
++export interface CronJobDefinition {
++  readonly jobName: JobName;
++  readonly totalSlots: number;
++  readonly workerId: WorkerId;
++  readonly membershipTtlMs: number;
++  readonly leaseTtlMs: number;
++  readonly coordinationTtlMs: number;
++  executeSlot(slotId: SlotId): Promise<void>;
++}
++
++export interface CronJobInstance {
++  tick(): Promise<TickPlanResult>;
++}
++
++export function createCronJobFactory(deps: CronJobFactoryDeps) {
++  return function createCronJob(definition: CronJobDefinition): CronJobInstance {
++    return {
++      async tick(): Promise<TickPlanResult> {
++        const now = deps.clock.now();
++
++        await deps.membership.heartbeat({
++          jobName: definition.jobName,
++          workerId: definition.workerId,
++          ttlMs: definition.membershipTtlMs,
++          now,
++        });
++
++        const coordinationResult = await deps.criticalSection.runExclusive(
++          `${definition.jobName}:rebalance`,
++          definition.coordinationTtlMs,
++          async () => {
++            const activeWorkers = await deps.membership.listActiveWorkers(definition.jobName, now);
++            const currentLeases = await deps.leases.listLeases(definition.jobName, now);
++            const plan = deps.slotAllocator.plan({
++              jobName: definition.jobName,
++              workerId: definition.workerId,
++              totalSlots: definition.totalSlots,
++              activeWorkers,
++              currentLeases,
++            });
++
++            const releasedSlots: SlotId[] = [];
++            for (const slotId of plan.slotsToRelease) {
++              await deps.leases.releaseLease({
++                jobName: definition.jobName,
++                slotId,
++                ownerId: definition.workerId,
++              });
++              releasedSlots.push(slotId);
++            }
++
++            const renewedSlots: SlotId[] = [];
++            for (const slotId of plan.slotsToRenew) {
++              const renewed = await deps.leases.renewLease({
++                jobName: definition.jobName,
++                slotId,
++                ownerId: definition.workerId,
++                leaseUntil: now + definition.leaseTtlMs,
++                now,
++              });
++              if (renewed) {
++                renewedSlots.push(slotId);
++              }
++            }
++
++            const acquiredSlots: SlotId[] = [];
++            for (const slotId of plan.slotsToAcquire) {
++              const acquired = await deps.leases.claimLease({
++                jobName: definition.jobName,
++                slotId,
++                ownerId: definition.workerId,
++                leaseUntil: now + definition.leaseTtlMs,
++                now,
++              });
++              if (acquired) {
++                acquiredSlots.push(slotId);
++              }
++            }
++
++            const runnableSlots = [...renewedSlots, ...acquiredSlots].sort((left, right) => left - right);
++
++            return {
++              desiredSlots: plan.desiredSlots,
++              runnableSlots,
++              acquiredSlots,
++              renewedSlots,
++              releasedSlots,
++              blockedSlots: plan.blockedSlots,
++            } satisfies TickPlanResult;
++          },
++        );
++
++        for (const slotId of coordinationResult.runnableSlots) {
++          await definition.executeSlot(slotId);
++        }
++
++        return coordinationResult;
++      },
++    };
++  };
++}
+diff --git a/src/cron/core/ports.ts b/src/cron/core/ports.ts
+new file mode 100644
+index 0000000..8dcdcd2
+--- /dev/null
++++ b/src/cron/core/ports.ts
+@@ -0,0 +1,50 @@
++import type { JobName, SlotId, SlotLease, SlotRebalanceInput, SlotRebalancePlan, WorkerId } from './types';
++
++export interface ClockPort {
++  now(): number;
++}
++
++export interface ClusterMembershipPort {
++  heartbeat(params: {
++    readonly jobName: JobName;
++    readonly workerId: WorkerId;
++    readonly ttlMs: number;
++    readonly now: number;
++  }): Promise<void>;
++
++  listActiveWorkers(jobName: JobName, now: number): Promise<readonly WorkerId[]>;
++}
++
++export interface SlotLeasePort {
++  listLeases(jobName: JobName, now: number): Promise<readonly SlotLease[]>;
++
++  claimLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++    readonly leaseUntil: number;
++    readonly now: number;
++  }): Promise<boolean>;
++
++  renewLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++    readonly leaseUntil: number;
++    readonly now: number;
++  }): Promise<boolean>;
++
++  releaseLease(params: {
++    readonly jobName: JobName;
++    readonly slotId: SlotId;
++    readonly ownerId: WorkerId;
++  }): Promise<void>;
++}
++
++export interface CriticalSectionPort {
++  runExclusive<T>(key: string, ttlMs: number, task: () => Promise<T>): Promise<T>;
++}
++
++export interface SlotAllocatorPort {
++  plan(input: SlotRebalanceInput): SlotRebalancePlan;
++}
+diff --git a/src/cron/core/slotAllocator.ts b/src/cron/core/slotAllocator.ts
+new file mode 100644
+index 0000000..09ff31a
+--- /dev/null
++++ b/src/cron/core/slotAllocator.ts
+@@ -0,0 +1,73 @@
++import type { SlotAllocatorPort } from './ports';
++import type { SlotId, SlotLease, SlotRebalanceInput, SlotRebalancePlan, WorkerId } from './types';
++
++function uniqueSortedWorkers(workers: readonly WorkerId[]): WorkerId[] {
++  return [...new Set(workers)].sort((left, right) => left.localeCompare(right));
++}
++
++function buildDesiredSlots(workerId: WorkerId, workers: readonly WorkerId[], totalSlots: number): SlotId[] {
++  const orderedWorkers = uniqueSortedWorkers(workers);
++  const workerIndex = orderedWorkers.indexOf(workerId);
++
++  if (workerIndex === -1 || totalSlots <= 0) {
++    return [];
++  }
++
++  const desiredSlots: SlotId[] = [];
++
++  for (let slotId = 0; slotId < totalSlots; slotId += 1) {
++    if (slotId % orderedWorkers.length === workerIndex) {
++      desiredSlots.push(slotId);
++    }
++  }
++
++  return desiredSlots;
++}
++
++function buildLeaseIndex(currentLeases: readonly SlotLease[]): Map<SlotId, SlotLease> {
++  return new Map(currentLeases.map((lease) => [lease.slotId, lease]));
++}
++
++export function planSlotRebalance(input: SlotRebalanceInput): SlotRebalancePlan {
++  const desiredSlots = buildDesiredSlots(input.workerId, input.activeWorkers, input.totalSlots);
++  const desiredSlotSet = new Set(desiredSlots);
++  const leaseIndex = buildLeaseIndex(input.currentLeases);
++
++  const slotsToAcquire: SlotId[] = [];
++  const slotsToRenew: SlotId[] = [];
++  const blockedSlots: SlotId[] = [];
++
++  for (const slotId of desiredSlots) {
++    const lease = leaseIndex.get(slotId);
++
++    if (!lease) {
++      slotsToAcquire.push(slotId);
++      continue;
++    }
++
++    if (lease.ownerId === input.workerId) {
++      slotsToRenew.push(slotId);
++      continue;
++    }
++
++    blockedSlots.push(slotId);
++  }
++
++  const slotsToRelease = input.currentLeases
++    .filter((lease) => lease.ownerId === input.workerId)
++    .map((lease) => lease.slotId)
++    .filter((slotId) => !desiredSlotSet.has(slotId))
++    .sort((left, right) => left - right);
++
++  return {
++    desiredSlots,
++    slotsToAcquire,
++    slotsToRenew,
++    slotsToRelease,
++    blockedSlots,
++  };
++}
++
++export const roundRobinSlotAllocator: SlotAllocatorPort = {
++  plan: planSlotRebalance,
++};
+diff --git a/src/cron/core/types.ts b/src/cron/core/types.ts
+new file mode 100644
+index 0000000..4a9ffa2
+--- /dev/null
++++ b/src/cron/core/types.ts
+@@ -0,0 +1,35 @@
++export type JobName = string;
++export type WorkerId = string;
++export type SlotId = number;
++
++export interface SlotLease {
++  readonly jobName: JobName;
++  readonly slotId: SlotId;
++  readonly ownerId: WorkerId;
++  readonly leaseUntil: number;
++}
++
++export interface SlotRebalanceInput {
++  readonly jobName: JobName;
++  readonly workerId: WorkerId;
++  readonly totalSlots: number;
++  readonly activeWorkers: readonly WorkerId[];
++  readonly currentLeases: readonly SlotLease[];
++}
++
++export interface SlotRebalancePlan {
++  readonly desiredSlots: readonly SlotId[];
++  readonly slotsToAcquire: readonly SlotId[];
++  readonly slotsToRenew: readonly SlotId[];
++  readonly slotsToRelease: readonly SlotId[];
++  readonly blockedSlots: readonly SlotId[];
++}
++
++export interface TickPlanResult {
++  readonly desiredSlots: readonly SlotId[];
++  readonly runnableSlots: readonly SlotId[];
++  readonly acquiredSlots: readonly SlotId[];
++  readonly renewedSlots: readonly SlotId[];
++  readonly releasedSlots: readonly SlotId[];
++  readonly blockedSlots: readonly SlotId[];
++}
+diff --git a/tests/cron/slotAllocator.unit.ts b/tests/cron/slotAllocator.unit.ts
+new file mode 100644
+index 0000000..f167c1a
+--- /dev/null
++++ b/tests/cron/slotAllocator.unit.ts
+@@ -0,0 +1,81 @@
++import { planSlotRebalance } from '../../src/cron/core/slotAllocator';
++import type { SlotRebalanceInput } from '../../src/cron/core/types';
++
++function assertDeepEqual<T>(actual: T, expected: T, label: string): void {
++  const actualJson = JSON.stringify(actual);
++  const expectedJson = JSON.stringify(expected);
++
++  if (actualJson !== expectedJson) {
++    throw new Error(`${label}\nexpected: ${expectedJson}\nactual:   ${actualJson}`);
++  }
++}
++
++function runCase(input: SlotRebalanceInput, expected: ReturnType<typeof planSlotRebalance>, label: string): void {
++  const actual = planSlotRebalance(input);
++  assertDeepEqual(actual, expected, label);
++}
++
++runCase(
++  {
++    jobName: 'email-digest',
++    workerId: 'worker-b',
++    totalSlots: 6,
++    activeWorkers: ['worker-a', 'worker-b', 'worker-c'],
++    currentLeases: [
++      { jobName: 'email-digest', slotId: 0, ownerId: 'worker-a', leaseUntil: 10_000 },
++      { jobName: 'email-digest', slotId: 1, ownerId: 'worker-b', leaseUntil: 10_000 },
++      { jobName: 'email-digest', slotId: 4, ownerId: 'worker-c', leaseUntil: 10_000 },
++    ],
++  },
++  {
++    desiredSlots: [1, 4],
++    slotsToAcquire: [],
++    slotsToRenew: [1],
++    slotsToRelease: [],
++    blockedSlots: [4],
++  },
++  'worker-b should renew owned slots and skip slots owned by other workers',
++);
++
++runCase(
++  {
++    jobName: 'email-digest',
++    workerId: 'worker-a',
++    totalSlots: 5,
++    activeWorkers: ['worker-a', 'worker-b'],
++    currentLeases: [
++      { jobName: 'email-digest', slotId: 0, ownerId: 'worker-a', leaseUntil: 10_000 },
++      { jobName: 'email-digest', slotId: 2, ownerId: 'worker-a', leaseUntil: 10_000 },
++      { jobName: 'email-digest', slotId: 4, ownerId: 'worker-a', leaseUntil: 10_000 },
++    ],
++  },
++  {
++    desiredSlots: [0, 2, 4],
++    slotsToAcquire: [],
++    slotsToRenew: [0, 2, 4],
++    slotsToRelease: [],
++    blockedSlots: [],
++  },
++  'single worker ownership remains stable when partition already matches desired slots',
++);
++
++runCase(
++  {
++    jobName: 'email-digest',
++    workerId: 'worker-c',
++    totalSlots: 4,
++    activeWorkers: ['worker-a', 'worker-b', 'worker-c'],
++    currentLeases: [
++      { jobName: 'email-digest', slotId: 2, ownerId: 'worker-c', leaseUntil: 10_000 },
++      { jobName: 'email-digest', slotId: 3, ownerId: 'worker-c', leaseUntil: 10_000 },
++    ],
++  },
++  {
++    desiredSlots: [2],
++    slotsToAcquire: [],
++    slotsToRenew: [2],
++    slotsToRelease: [3],
++    blockedSlots: [],
++  },
++  'worker-c should release slots that no longer belong to it after membership changes',
++);
