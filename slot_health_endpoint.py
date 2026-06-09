@@ -1,0 +1,139 @@
+import http.server
+import json
+import threading
+import time
+from typing import Optional
+
+class SlotHealthState:
+    """
+    维护当前 Pod 的 Slot 占用状态，并提供线程安全的访问
+    """
+    def __init__(self):
+        self._is_holding_slot = False
+        self._lock = threading.Lock()
+        
+    def set_slot_status(self, is_holding: bool):
+        """
+        更新 Slot 的占用状态
+        """
+        with self._lock:
+            self._is_holding_slot = is_holding
+            
+    def get_slot_status(self) -> bool:
+        """
+        获取当前 Slot 是否被占用
+        """
+        with self._lock:
+            return self._is_holding_slot
+
+
+class HealthRequestHandler(http.server.BaseHTTPRequestHandler):
+    """
+    处理 K8s 的 HTTP 请求
+    """
+    def __init__(self, request, client_address, server):
+        # 从 server 实例中获取共享的状态对象
+        self.state: SlotHealthState = server.slot_state
+        super().__init__(request, client_address, server)
+
+    def do_GET(self):
+        if self.path == '/health':
+            is_holding = self.state.get_slot_status()
+            
+            # 构造响应数据
+            response_data = {
+                "holding_slot": is_holding,
+                "message": "Pod is currently holding a slot." if is_holding else "Pod is idle and can be safely terminated."
+            }
+            
+            # 返回 200 OK
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response_data).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    # 禁用默认的日志输出，避免在 K8s 中产生过多无用的健康检查日志
+    def log_message(self, format, *args):
+        pass
+
+
+class HealthServer:
+    """
+    轻量级的后台 HTTP 服务器，用于暴露 Pod 的健康和 Slot 状态
+    """
+    def __init__(self, port: int = 8080):
+        self.port = port
+        self.state = SlotHealthState()
+        self.server: Optional[http.server.HTTPServer] = None
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """在后台线程启动 HTTP Server"""
+        self.server = http.server.HTTPServer(('0.0.0.0', self.port), HealthRequestHandler)
+        # 将状态绑定到 server 实例上，以便 handler 可以访问
+        self.server.slot_state = self.state
+        
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        print(f"Health endpoint started on port {self.port}")
+
+    def stop(self):
+        """停止 HTTP Server"""
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        if self.thread:
+            self.thread.join()
+
+
+# ================= 使用示例 =================
+if __name__ == "__main__":
+    import signal
+    import sys
+
+    # 1. 初始化并启动健康检查服务
+    health_server = HealthServer(port=8080)
+    health_server.start()
+
+    # 2. 模拟应用处理逻辑
+    def application_logic():
+        print("[App] Acquiring slot... Start processing.")
+        health_server.state.set_slot_status(True)
+        
+        # 模拟正在处理长时间任务 (例如 WebSocket 保持、大文件上传等)
+        # 在此期间如果 K8s 发起缩容，preStop hook 可以通过 /health 发现 holding_slot 为 true
+        time.sleep(10) 
+        
+        print("[App] Releasing slot... Processing done.")
+        health_server.state.set_slot_status(False)
+
+    # 3. 模拟优雅退出信号处理 (接收到 SIGTERM)
+    def handle_sigterm(signum, frame):
+        print("\n[System] Received SIGTERM from Kubernetes, initiating graceful shutdown...")
+        
+        # 等待直到 slot 释放或超时 (由 Kubernetes 的 terminationGracePeriodSeconds 和 drainTimeoutMs 共同保证)
+        while health_server.state.get_slot_status():
+            print("[System] Still holding slot, waiting for tasks to drain...")
+            time.sleep(1)
+        
+        print("[System] Slot released, shutting down safely.")
+        health_server.stop()
+        sys.exit(0)
+
+    # 绑定信号
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    # 运行业务逻辑
+    try:
+        # 在真实应用中，这里可能是个事件循环或者工作线程池
+        application_logic()
+        
+        # 保持主线程运行以响应信号
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        handle_sigterm(signal.SIGINT, None)
