@@ -25,14 +25,12 @@ export class CronJobFactory {
   private parsePattern(patternWithTz: string): { cronExpression: string; timezone: string } {
     const parts = patternWithTz.trim().split(/\s+/);
     
-    // 假设标准 cron 为 5 位 (分 时 日 月 周)
-    // 如果超过 5 位，并且最后一位不是数字也不是 *，我们假设它是时区
+    // 假设标准 cron 为 5 或 6 位，如果最后一位包含字母或斜杠（如 America/New_York），则将其视为时区
     let cronExpression = patternWithTz;
     let timezone = 'UTC'; // 默认 UTC
 
     if (parts.length > 5) {
       const lastPart = parts[parts.length - 1];
-      // 简单的启发式检查：如果最后一部分包含字母或斜杠（如 America/New_York）
       if (/[a-zA-Z\/]+/.test(lastPart)) {
         timezone = lastPart;
         cronExpression = parts.slice(0, parts.length - 1).join(' ');
@@ -82,7 +80,6 @@ export class CronJobFactory {
 
     console.log('Cron scheduler started...');
     
-    // 核心调度循环，每秒检查一次
     this.timer = setInterval(async () => {
       const now = Date.now();
 
@@ -90,17 +87,15 @@ export class CronJobFactory {
         if (now >= job.nextRunTime) {
           console.log(`[Job Triggered] ${job.name} at ${new Date().toISOString()}`);
           
-          // 异步执行任务，不阻塞调度器
           Promise.resolve(job.task()).catch(err => {
             console.error(`[Job Error] ${job.name}:`, err);
           });
 
-          // 计算并更新下一次执行时间
           job.nextRunTime = this.calculateNextRun(job.cronExpression, job.timezone);
           console.log(`[Job Next Run] ${job.name} scheduled for ${new Date(job.nextRunTime).toISOString()}`);
         }
       }
-    }, 1000); // 1秒精度
+    }, 1000);
   }
 
   public stop(): void {
@@ -111,26 +106,3 @@ export class CronJobFactory {
     }
   }
 }
-
-// ==========================================
-// 示例用法
-// ==========================================
-/*
-const factory = new CronJobFactory();
-
-// 1. 使用默认 UTC 时间
-factory.createJob({
-  name: 'DailyUTCJob',
-  patternWithTz: '0 9 * * *', // 每天 UTC 09:00
-  task: () => console.log('Executing UTC Job')
-});
-
-// 2. 使用指定时区
-factory.createJob({
-  name: 'DailyNewYorkJob',
-  patternWithTz: '0 9 * * * America/New_York', // 每天纽约时间 09:00
-  task: () => console.log('Executing New York Job')
-});
-
-factory.start();
-*/
